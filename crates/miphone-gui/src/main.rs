@@ -21,6 +21,7 @@ use miphone::config::{MicollabConfig, SipConfig};
 use miphone::media::{self, AudioSettings};
 use miphone::micollab::{self, Contact, Status};
 use miphone::provision;
+use miphone::ringtone::{self, Ringer, Tone};
 use miphone::store::{CallRecord, DirectoryCache, Settings, Store};
 use miphone::ua::{self, CallPhase, CallSnapshot, Command, Event, Snapshot};
 use miphone::wsp::{self, Indicator, Presence, ServerEvent, Watchlist};
@@ -520,6 +521,17 @@ struct App {
     /// Calls missed since the history page was last looked at, shown as a badge on its icon.
     missed_calls: usize,
     audio: AudioSettings,
+    /// Output devices the ringtone plays on; none is the system default.
+    ring_outputs: Vec<String>,
+    ring_tone: Tone,
+    /// Volume of the ringtone in percent.
+    ring_volume: u8,
+    /// The ringtone while it plays, for a call or as a sample in the settings.
+    ringer: Option<Ringer>,
+    /// The user is listening to the ringtone in the settings.
+    ring_preview: bool,
+    /// Demo mode shows calls that are not there and does not ring for them.
+    demo: bool,
     inputs: Vec<String>,
     outputs: Vec<String>,
     /// Encrypted storage; `None` if it could not be opened (then nothing is saved) or after
@@ -561,6 +573,9 @@ struct App {
     /// Names of all contacts by dialled digits, to show names instead of bare numbers.
     names_by_number: HashMap<String, String>,
 }
+
+/// Volume of the ringtone in percent until the user chooses one.
+const DEFAULT_RING_VOLUME: u8 = 70;
 
 /// At most this many contacts are listed at once; a search narrows it down.
 const CONTACTS_SHOWN: usize = 200;
@@ -733,6 +748,12 @@ impl App {
             history: Vec::new(),
             missed_calls: 0,
             audio: AudioSettings::default(),
+            ring_outputs: Vec::new(),
+            ring_tone: Tone::default(),
+            ring_volume: DEFAULT_RING_VOLUME,
+            ringer: None,
+            ring_preview: false,
+            demo: false,
             inputs,
             outputs,
             store: None,
@@ -791,6 +812,9 @@ impl App {
         self.login.teleworker = settings.teleworker;
         self.saved_password = settings.password;
         self.last_name_first = settings.last_name_first;
+        self.ring_outputs = settings.ring_outputs;
+        self.ring_tone = Tone::from_setting(&settings.ringtone);
+        self.ring_volume = settings.ring_volume.unwrap_or(DEFAULT_RING_VOLUME).min(100);
         self.history = store.recent_calls(HISTORY_SHOWN).unwrap_or_default().into_iter().map(HistoryEntry::from_record).collect();
         self.set_own_contacts(store.own_contacts().unwrap_or_default());
         self.store = Some(store);
@@ -834,6 +858,10 @@ impl App {
         self.set_contacts(Vec::new());
         self.directory_timestamp = serde_json::Value::Null;
         *self.audio.lock().unwrap() = Default::default();
+        self.ring_outputs.clear();
+        self.ring_tone = Tone::default();
+        self.ring_volume = DEFAULT_RING_VOLUME;
+        self.ring_preview = false;
         self.theme = egui::ThemePreference::System;
         ctx.set_theme(self.theme);
     }
@@ -854,6 +882,9 @@ impl App {
             audio_input: devices.input,
             audio_output: devices.output,
             last_name_first: self.last_name_first,
+            ring_outputs: self.ring_outputs.clone(),
+            ringtone: self.ring_tone.to_setting(),
+            ring_volume: Some(self.ring_volume),
         };
         if let Err(e) = store.save_settings(&settings) {
             self.status_line = format!("Speichern fehlgeschlagen: {e:#}");
@@ -861,6 +892,7 @@ impl App {
     }
 
     fn enter_demo(&mut self, variant: &str) {
+        self.demo = true;
         self.logged_in = true;
         self.number = Some("1234".into());
         self.user_name = "Max Mustermann".into();
@@ -1137,6 +1169,23 @@ impl App {
         match self.names_by_number.get(&number_key(peer)) {
             Some(name) => format!("{name} ({peer})"),
             None => peer.to_string(),
+        }
+    }
+
+    /// Starts and stops the ringtone: it plays while a call rings here and while the user
+    /// listens to it in the settings.
+    fn update_ringer(&mut self) {
+        let incoming = self.state.call.as_ref().is_some_and(|call| call.phase == CallPhase::Incoming) && !self.demo;
+        if self.page != Page::Settings || !self.logged_in {
+            self.ring_preview = false;
+        }
+        match (incoming || self.ring_preview, self.ringer.is_some()) {
+            (true, false) => self.ringer = Some(Ringer::start(self.ring_tone.clone(), self.ring_outputs.clone(), self.ring_volume as f32 / 100.0)),
+            (false, true) => self.ringer = None,
+            _ => {}
+        }
+        if let Some(error) = self.ringer.as_ref().and_then(Ringer::take_error) {
+            self.status_line = error;
         }
     }
 
@@ -1547,7 +1596,9 @@ impl App {
             Page::Phone => self.phone_page(ui),
             Page::Contacts => self.contacts_page(ui),
             Page::History => self.history_page(ui),
-            Page::Settings => self.settings_page(ui),
+            Page::Settings => {
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.settings_page(ui));
+            }
         });
         let ctx = ui.ctx().clone();
         self.save_offer_window(&ctx);
@@ -2045,6 +2096,87 @@ impl App {
             (self.inputs, self.outputs) = media::list_devices();
         }
         ui.label(egui::RichText::new("Die Auswahl gilt ab dem nächsten Gespräch.").weak().small());
+        ui.add_space(16.0);
+        self.ringtone_settings(ui);
+    }
+
+    /// Where the ringtone plays, which one and how loud.
+    fn ringtone_settings(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Klingelton").strong());
+        let (outputs_before, tone_before) = (self.ring_outputs.clone(), self.ring_tone.clone());
+
+        ui.add_space(4.0);
+        ui.label("Ausgabegeräte");
+        let chosen = match self.ring_outputs.as_slice() {
+            [] => "Standardgerät".to_string(),
+            [one] => one.clone(),
+            several => format!("{} Geräte", several.len()),
+        };
+        // Devices chosen earlier that are unplugged now stay in the list, to be unticked.
+        let missing: Vec<String> = self.ring_outputs.iter().filter(|name| !self.outputs.contains(name)).cloned().collect();
+        egui::ComboBox::from_id_salt("ring_out")
+            .width(280.0)
+            .selected_text(chosen)
+            // Several devices can be ticked, so a click inside does not close the list.
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(self.ring_outputs.is_empty(), "Standardgerät").clicked() {
+                    self.ring_outputs.clear();
+                }
+                for name in self.outputs.iter().chain(&missing) {
+                    let mut ticked = self.ring_outputs.contains(name);
+                    if ui.checkbox(&mut ticked, name).changed() {
+                        self.ring_outputs.retain(|n| n != name);
+                        if ticked {
+                            self.ring_outputs.push(name.clone());
+                        }
+                    }
+                }
+            });
+
+        ui.add_space(4.0);
+        ui.label("Ton");
+        let mut browse = false;
+        egui::ComboBox::from_id_salt("ring_tone").width(280.0).selected_text(self.ring_tone.label()).show_ui(ui, |ui| {
+            for (index, (name, _)) in ringtone::BUILTIN.iter().enumerate() {
+                ui.selectable_value(&mut self.ring_tone, Tone::Builtin(index), *name);
+            }
+            // The user's own file, once one was picked.
+            if let Tone::File(path) = &self.ring_tone {
+                let _ = ui.selectable_label(true, self.ring_tone.label()).on_hover_text(path.to_string_lossy());
+            }
+            browse = ui.selectable_label(false, "Durchsuche...").clicked();
+        });
+        if browse {
+            let dialog = rfd::FileDialog::new().set_title("Klingelton wählen").add_filter("Audiodateien", &ringtone::FILE_EXTENSIONS);
+            if let Some(path) = dialog.pick_file() {
+                self.ring_tone = Tone::File(path);
+            }
+        }
+
+        ui.add_space(4.0);
+        ui.label("Lautstärke");
+        ui.horizontal(|ui| {
+            let slider = ui.add(egui::Slider::new(&mut self.ring_volume, 0..=100).suffix(" %"));
+            if slider.changed() {
+                if let Some(ringer) = &self.ringer {
+                    ringer.set_volume(self.ring_volume as f32 / 100.0);
+                }
+            }
+            // Saved once the slider is let go, not for every step on the way.
+            if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+                self.persist();
+            }
+            if ui.button(if self.ring_preview { "Stopp" } else { "Anhören" }).clicked() {
+                self.ring_preview = !self.ring_preview;
+            }
+        });
+
+        if self.ring_outputs != outputs_before || self.ring_tone != tone_before {
+            self.persist();
+            // What is playing starts again with the new choice.
+            self.ringer = None;
+        }
     }
 }
 
@@ -2106,6 +2238,7 @@ fn number_of(peer: &str) -> String {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_backend(ctx);
+        self.update_ringer();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

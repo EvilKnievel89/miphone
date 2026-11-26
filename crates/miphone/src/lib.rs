@@ -5,6 +5,7 @@ pub mod config;
 pub mod media;
 pub mod micollab;
 pub mod provision;
+pub mod ringtone;
 pub mod store;
 pub mod ua;
 pub mod wsp;

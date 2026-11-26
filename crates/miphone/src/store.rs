@@ -42,6 +42,13 @@ pub struct Settings {
     /// Contact list as "Last, First" sorted by last name instead of "First Last" sorted by
     /// first name.
     pub last_name_first: bool,
+    /// Output devices the ringtone plays on, by name; none is the system default.
+    pub ring_outputs: Vec<String>,
+    /// The ringtone: `builtin:<index>` or the path of a sound file; empty is the first
+    /// built-in tone.
+    pub ringtone: String,
+    /// Volume of the ringtone in percent; `None` is the program's default.
+    pub ring_volume: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +317,9 @@ mod tests {
             audio_input: Some("Headset Mikrofon".into()),
             audio_output: None,
             last_name_first: true,
+            ring_outputs: vec!["Headset Lautsprecher".into(), "Monitor".into()],
+            ringtone: "builtin:1".into(),
+            ring_volume: Some(40),
         };
         store.save_settings(&settings).unwrap();
         let raw = std::fs::read(dir.path().join("settings.dat")).unwrap();

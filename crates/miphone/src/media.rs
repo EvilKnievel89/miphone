@@ -43,7 +43,7 @@ pub fn list_devices() -> (Vec<String>, Vec<String>) {
     (names(host.input_devices().ok().map(Iterator::collect)), names(host.output_devices().ok().map(Iterator::collect)))
 }
 
-fn device_name(device: &cpal::Device) -> Option<String> {
+pub(crate) fn device_name(device: &cpal::Device) -> Option<String> {
     device.description().ok().map(|d| d.name().to_string())
 }
 

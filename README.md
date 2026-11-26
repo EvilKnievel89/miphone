@@ -25,6 +25,8 @@ Windows only. The user interface is in German.
 - **Hot desking**: follows the server's hot desk login and logout.
 - **Presence**: shows and sets the own status, shows the status of contacts.
 - **Phone book**: the corporate directory and the user's contact groups, with search.
+- **Ringtone**: two built-in tones or a sound file of your own, on one or several output
+  devices, with its own volume.
 - **Own contacts**: contacts the user creates, stored encrypted on the computer only.
 - **Call history**, kept locally.
 - **Local data is encrypted** with the Windows account (DPAPI) under `%APPDATA%\miphone`.
