@@ -60,6 +60,10 @@ sign-in the window has four pages: phone, contacts, history and settings.
 Only one softphone can be registered for an extension at a time. Switch the softphone of
 the original client off before using this one.
 
+`miphone-gui.exe --profile:<name>` uses a profile: settings, contacts and history are then
+kept in `%APPDATA%\miphone.<name>` instead of `%APPDATA%\miphone`, so several accounts can be
+used side by side. The name may contain letters, digits, `-` and `_`.
+
 `miphone-gui.exe --demo` opens the window with sample data and without any network
 connection, which is useful when working on the layout. Variants: `--demo=call`,
 `incoming`, `history`, `settings`, `status`, `contacts`, `numbers`, `own`, `newcontact`, `savenumber`, `missed`,

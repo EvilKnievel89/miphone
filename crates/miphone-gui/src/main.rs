@@ -27,15 +27,31 @@ use miphone::wsp::{self, Indicator, Presence, ServerEvent, Watchlist};
 use tokio::sync::mpsc;
 
 fn main() -> eframe::Result {
+    // The profile is part of the title, to tell the windows of several profiles apart.
+    let title = match profile_argument() {
+        Some(profile) => format!("miphone {} – {profile}", env!("CARGO_PKG_VERSION")),
+        None => concat!("miphone ", env!("CARGO_PKG_VERSION")).to_string(),
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title(concat!("miphone ", env!("CARGO_PKG_VERSION")))
+            .with_title(title)
             .with_inner_size([400.0 * UI_SCALE, 660.0 * UI_SCALE])
             .with_min_inner_size([360.0 * UI_SCALE, 560.0 * UI_SCALE])
             .with_icon(window_icon()),
         ..Default::default()
     };
     eframe::run_native("miphone", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+}
+
+/// The profile named on the command line with `--profile:<name>`. Each profile keeps its
+/// settings, contacts and history in a folder of its own, so several accounts can be used
+/// side by side.
+fn profile_argument() -> Option<String> {
+    profile_in(std::env::args().skip(1))
+}
+
+fn profile_in(args: impl Iterator<Item = String>) -> Option<String> {
+    args.into_iter().find_map(|a| a.strip_prefix("--profile:").or_else(|| a.strip_prefix("--profile=")).map(|name| name.trim().to_string()))
 }
 
 /// Everything (texts, icons, spacing) is drawn this much larger than egui's default size.
@@ -753,7 +769,7 @@ impl App {
 
     /// Loads settings and history from the encrypted store and logs in if the user chose to stay logged in.
     fn restore(&mut self, ctx: &egui::Context) {
-        let store = match Store::open() {
+        let store = match Store::open(profile_argument().as_deref()) {
             Ok(store) => store,
             Err(e) => {
                 self.login.error = Some(format!("Gespeicherte Daten sind nicht verfügbar, es wird nichts gespeichert: {e:#}"));
@@ -790,7 +806,7 @@ impl App {
     /// Opens the store again after a reset removed it. Does nothing if it is open.
     fn ensure_store(&mut self) {
         if self.store.is_none() && self.store_usable {
-            self.store = Store::open().ok();
+            self.store = Store::open(profile_argument().as_deref()).ok();
         }
     }
 
@@ -2193,6 +2209,16 @@ mod tests {
         // Numbers of a kind the form does not know are kept in the free fields.
         let foreign = Contact { phones: vec![contact.phones[0].clone(), micollab::Phone { number: "1001".into(), label: "Work".into() }], ..contact };
         assert_eq!(ContactForm::edit(&foreign).numbers, ["1001".to_string(), "0170 1234567".into(), String::new()]);
+    }
+
+    #[test]
+    fn reads_profile_from_command_line() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>().into_iter();
+        assert_eq!(profile_in(args(&["--profile:buero"])).as_deref(), Some("buero"));
+        assert_eq!(profile_in(args(&["--demo=call", "--profile=zwei"])).as_deref(), Some("zwei"));
+        assert_eq!(profile_in(args(&["--demo", "profile:x"])), None);
+        // An empty name is passed on and refused when the store is opened.
+        assert_eq!(profile_in(args(&["--profile:"])).as_deref(), Some(""));
     }
 
     #[test]

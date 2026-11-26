@@ -1,4 +1,5 @@
-//! Persistent data of the softphone under `%APPDATA%\miphone` (roaming profile).
+//! Persistent data of the softphone under `%APPDATA%\miphone` (roaming profile), or under
+//! `%APPDATA%\miphone.<profile>` when the program was started with a profile name.
 //!
 //! Everything written is encrypted with the Windows data protection API (DPAPI) for the
 //! logged-in Windows user, so the files are useless to other users and on other machines
@@ -70,9 +71,11 @@ pub struct Store {
 
 impl Store {
     /// Opens the store in the user's roaming application data folder, creating it if needed.
-    pub fn open() -> Result<Store> {
+    /// A profile has a store of its own beside the one used without a profile.
+    pub fn open(profile: Option<&str>) -> Result<Store> {
+        let folder = folder_name(profile)?;
         let appdata = std::env::var_os("APPDATA").ok_or_else(|| anyhow!("Umgebungsvariable APPDATA fehlt"))?;
-        Store::open_in(&PathBuf::from(appdata).join("miphone"))
+        Store::open_in(&PathBuf::from(appdata).join(folder))
     }
 
     pub fn open_in(dir: &Path) -> Result<Store> {
@@ -197,6 +200,16 @@ impl Store {
     }
 }
 
+/// Name of the store's folder: `miphone`, or `miphone.<profile>` for a profile. The profile
+/// becomes part of a folder name, so only letters, digits, `-` and `_` are accepted.
+pub fn folder_name(profile: Option<&str>) -> Result<String> {
+    match profile {
+        None => Ok("miphone".to_string()),
+        Some(name) if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') => Ok(format!("miphone.{name}")),
+        Some(name) => Err(anyhow!("Ungültiger Profilname \"{name}\": erlaubt sind Buchstaben, Ziffern, - und _")),
+    }
+}
+
 /// Ids of the user's own contacts start with this, so they cannot collide with ids of the
 /// corporate directory.
 const OWN_CONTACT_PREFIX: &str = "own-";
@@ -269,6 +282,16 @@ mod tests {
         damaged[last] ^= 0xff;
         assert!(dpapi::unprotect(&damaged).is_err());
         assert!(dpapi::unprotect(b"not a blob").is_err());
+    }
+
+    #[test]
+    fn profiles_have_their_own_folder() {
+        assert_eq!(folder_name(None).unwrap(), "miphone");
+        assert_eq!(folder_name(Some("Büro_2-test")).unwrap(), "miphone.Büro_2-test");
+        // Nothing that could leave the folder or is not a valid folder name.
+        for bad in ["", "..", "a/b", "a\\b", "a.b", "a b", "c:", "x*"] {
+            assert!(folder_name(Some(bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
