@@ -1,0 +1,44 @@
+# Konfiguration fuer miphone. Nach config.toml kopieren und ausfuellen.
+# config.toml ist in .gitignore eingetragen.
+
+# Variante 1 (empfohlen): Anmeldung am MiCollab-Server wie im Originalclient.
+# miphone fragt beim Start nach dem Kennwort (oder liest MIPHONE_MICOLLAB_PASSWORD)
+# und laedt das SIP-Konto vom Server. Das Kennwort wird nicht gespeichert.
+[micollab]
+server = "micollab.example.org"
+# Anmeldename wie im MiCollab-Client.
+user = "vorname.nachname@example.org"
+# Nur noetig, wenn das Konto mehrere Nebenstellen hat.
+# number = "1234"
+# Das Profil enthaelt meist zwei SIP-Konten: direkt an der Telefonanlage (nur im Firmennetz)
+# und als Teleworker ueber das Gateway (MBG). Ohne Angabe gilt, was das Profil vorsieht
+# ("Teleworker verwenden" im Originalclient); hier laesst es sich umstellen.
+# teleworker = true
+# Nur zum Testen: ungueltige TLS-Zertifikate akzeptieren.
+# tls_insecure = false
+
+# Variante 2: SIP-Konto von Hand eintragen ([micollab] dann weglassen).
+# Einzelne Angaben hier haben Vorrang vor dem heruntergeladenen Profil.
+[sip]
+# server = "mbg.example.org"
+# port = 5061
+# user = "vorname.nachname@example.org-1234"
+# password = ""          # oder Umgebungsvariable MIPHONE_SIP_PASSWORD
+
+# miphone gibt sich dem Telefonserver gegenueber wie das MiCollab-Softphone als
+# "Mitel UC Endpoint" aus, weil der Server nur Geraetetypen annimmt, die er fuer die
+# Nebenstelle kennt (sonst: "Incompatible device type"). Beides laesst sich ueberschreiben:
+# user_agent = "Mitel-UC-Endpoint (UCA_Win10/10.3.8/undefined/Microsoft Windows NT 10.0)"
+# aastra_id = 'type="32" model="02" version="10.3.8.0" mac="0123456789ab"'   # "" laesst den Header weg
+# Sprachcodecs in der Reihenfolge, in der miphone sie anbietet. Opus klingt deutlich besser
+# (16 kHz statt 8 kHz); bei Problemen hier auf G.711 beschraenken: codecs = ["PCMA", "PCMU"]
+# codecs = ["opus", "PCMA", "PCMU"]
+
+# Gewuenschte Gueltigkeit der Registrierung in Sekunden (der Server kann kuerzen).
+# expires = 1800
+
+# Nach der Registrierung das Ereignis "mihotdesk" abonnieren, wie es der Originalclient tut.
+# hotdesk_subscribe = true
+
+# Nur zum Testen: ungueltige TLS-Zertifikate akzeptieren.
+# tls_insecure = false

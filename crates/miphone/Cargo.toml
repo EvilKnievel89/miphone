@@ -1,0 +1,31 @@
+[package]
+name = "miphone"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+aes = "0.9.4"
+anyhow = "1.0.105"
+base64 = "0.23.1"
+cpal = "0.18.2"
+futures-util = "0.3.34"
+httpdate = "1.0.3"
+misip = { version = "0.1.0", path = "../misip" }
+native-tls = "0.2.18"
+opus = "0.4.0"
+rand = "0.10.4"
+reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "json"] }
+rpassword = "7.5.5"
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.2"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tokio-native-tls = "0.3.1"
+tokio-tungstenite = { version = "0.30.0", features = ["native-tls"] }
+toml = "1.2.3"
+windows-sys = { version = "0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
