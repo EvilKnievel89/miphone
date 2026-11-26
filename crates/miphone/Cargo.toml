@@ -1,6 +1,6 @@
 [package]
 name = "miphone"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 license = "MIT"
 
@@ -11,7 +11,7 @@ base64 = "0.23.1"
 cpal = "0.18.2"
 futures-util = "0.3.34"
 httpdate = "1.0.3"
-misip = { version = "0.1.2", path = "../misip" }
+misip = { version = "0.1.3", path = "../misip" }
 native-tls = "0.2.18"
 opus = "0.4.0"
 rand = "0.10.4"
