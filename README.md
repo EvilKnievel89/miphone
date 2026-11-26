@@ -25,6 +25,7 @@ Windows only. The user interface is in German.
 - **Hot desking**: follows the server's hot desk login and logout.
 - **Presence**: shows and sets the own status, shows the status of contacts.
 - **Phone book**: the corporate directory and the user's contact groups, with search.
+- **Own contacts**: contacts the user creates, stored encrypted on the computer only.
 - **Call history**, kept locally.
 - **Local data is encrypted** with the Windows account (DPAPI) under `%APPDATA%\miphone`.
   The password is stored only if "stay signed in" is ticked.
@@ -61,7 +62,8 @@ the original client off before using this one.
 
 `miphone-gui.exe --demo` opens the window with sample data and without any network
 connection, which is useful when working on the layout. Variants: `--demo=call`,
-`incoming`, `history`, `settings`, `status`, `contacts`, `numbers`, `login`, `reset`.
+`incoming`, `history`, `settings`, `status`, `contacts`, `numbers`, `own`, `newcontact`,
+`login`, `reset`.
 
 ## Using the command line version
 

@@ -247,10 +247,7 @@ impl Client {
 
     pub async fn groups(&self) -> Result<Vec<Group>> {
         let result = self.rpc("GetCorpContactGroups", json!({})).await?;
-        Ok(first_object_list(&result)
-            .into_iter()
-            .filter_map(|g| Some(Group { id: g.get("id").filter(|i| !i.is_null())?.clone(), name: g.get("name")?.as_str()?.to_string() }))
-            .collect())
+        Ok(parse_groups(&result))
     }
 
     /// Ids of the contacts in a group.
@@ -300,6 +297,15 @@ fn parse_answer(name: &str, status: u16, text: &str) -> Result<Value> {
 fn parse_changes(result: &Value) -> ContactChanges {
     let ids = |key: &str| nested(result, key, "contactId").into_iter().filter_map(id_text).collect();
     ContactChanges { modified: ids("modified"), deleted: ids("deleted"), timestamp: result.get("timestamp").cloned().unwrap_or(Value::Null) }
+}
+
+fn parse_groups(result: &Value) -> Vec<Group> {
+    first_object_list(result)
+        .into_iter()
+        // The server keeps a list for its own use among the groups; it is not one to show.
+        .filter(|g| g.get("type").and_then(Value::as_str) != Some("LOGIN_NOTIFY"))
+        .filter_map(|g| Some(Group { id: g.get("id").filter(|i| !i.is_null())?.clone(), name: g.get("name")?.as_str()?.to_string() }))
+        .collect()
 }
 
 fn parse_contacts(result: &Value) -> Vec<Contact> {
@@ -384,6 +390,8 @@ mod tests {
         assert_eq!(first_object_list(&groups).len(), 2);
         assert_eq!(first_object_list(&json!({"wrapper":{"member":{"id":"c-1"}}})).len(), 1);
         assert!(first_object_list(&json!({"count":0})).is_empty());
+        let groups = json!({"corpContactGroup":[{"isEditable":true,"name":"LoginNotify","id":353,"type":"LOGIN_NOTIFY"},{"isEditable":true,"name":"Favorites","id":354,"type":"SUBSCRIBER"},{"id":4,"name":"Team"}]});
+        assert_eq!(parse_groups(&groups).iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), vec!["Favorites", "Team"]);
     }
 
     #[test]

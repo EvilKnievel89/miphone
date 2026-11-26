@@ -9,13 +9,16 @@
 //!   JSON document.
 //! * `history.db` - the call history, an SQLite database in which each row holds one
 //!   encrypted call record. Only the number of calls and the order they were made in are
-//!   visible without decryption.
+//!   visible without decryption. The contacts the user created are kept in the same
+//!   database in the same way.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+
+use crate::micollab::Contact;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -57,7 +60,7 @@ pub struct DirectoryCache {
     /// Server and user the directory was loaded for; a cache of another account is not used.
     pub owner: String,
     pub timestamp: serde_json::Value,
-    pub contacts: Vec<crate::micollab::Contact>,
+    pub contacts: Vec<Contact>,
 }
 
 pub struct Store {
@@ -76,6 +79,7 @@ impl Store {
         std::fs::create_dir_all(dir).with_context(|| format!("Ordner {} kann nicht angelegt werden", dir.display()))?;
         let db = Connection::open(dir.join("history.db")).context("Verlaufsdatenbank kann nicht geöffnet werden")?;
         db.execute("CREATE TABLE IF NOT EXISTS calls (id INTEGER PRIMARY KEY AUTOINCREMENT, record BLOB NOT NULL)", [])?;
+        db.execute("CREATE TABLE IF NOT EXISTS own_contacts (id INTEGER PRIMARY KEY AUTOINCREMENT, record BLOB NOT NULL)", [])?;
         Ok(Store { dir: dir.to_path_buf(), db })
     }
 
@@ -152,6 +156,54 @@ impl Store {
         self.db.execute("VACUUM", [])?;
         Ok(())
     }
+
+    /// Saves a contact the user created. A contact without id is new and gets one; with
+    /// an id it replaces the saved contact of that id.
+    pub fn save_own_contact(&self, contact: &mut Contact) -> Result<()> {
+        // The id is the row's key and not part of the stored record.
+        let blob = dpapi::protect(&serde_json::to_vec(&Contact { id: String::new(), ..contact.clone() })?)?;
+        match own_contact_row(&contact.id) {
+            Some(row) => {
+                if self.db.execute("UPDATE own_contacts SET record = ?1 WHERE id = ?2", (blob, row))? == 0 {
+                    return Err(anyhow!("Der Kontakt ist nicht mehr gespeichert"));
+                }
+            }
+            None => {
+                self.db.execute("INSERT INTO own_contacts (record) VALUES (?1)", [blob])?;
+                contact.id = format!("{OWN_CONTACT_PREFIX}{}", self.db.last_insert_rowid());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn delete_own_contact(&self, id: &str) -> Result<()> {
+        if let Some(row) = own_contact_row(id) {
+            self.db.execute("DELETE FROM own_contacts WHERE id = ?1", [row])?;
+        }
+        Ok(())
+    }
+
+    /// The contacts the user created. Rows that cannot be decrypted are skipped.
+    pub fn own_contacts(&self) -> Result<Vec<Contact>> {
+        let mut stmt = self.db.prepare("SELECT id, record FROM own_contacts ORDER BY id")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
+        Ok(rows
+            .filter_map(|row| row.ok())
+            .filter_map(|(id, blob)| {
+                let contact: Contact = serde_json::from_slice(&dpapi::unprotect(&blob).ok()?).ok()?;
+                Some(Contact { id: format!("{OWN_CONTACT_PREFIX}{id}"), ..contact })
+            })
+            .collect())
+    }
+}
+
+/// Ids of the user's own contacts start with this, so they cannot collide with ids of the
+/// corporate directory.
+const OWN_CONTACT_PREFIX: &str = "own-";
+
+/// The database row of an own contact's id; `None` for a contact not saved yet.
+fn own_contact_row(id: &str) -> Option<i64> {
+    id.strip_prefix(OWN_CONTACT_PREFIX)?.parse().ok()
 }
 
 /// Windows data protection for the current user.
@@ -277,7 +329,7 @@ mod tests {
 
     #[test]
     fn directory_cache_is_stored_encrypted() {
-        use crate::micollab::{Contact, Phone};
+        use crate::micollab::Phone;
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_in(dir.path()).unwrap();
         assert_eq!(store.load_directory(), DirectoryCache::default());
@@ -296,6 +348,41 @@ mod tests {
         let raw = std::fs::read(dir.path().join("contacts.dat")).unwrap();
         assert!(!contains(&raw, b"Erika") && !contains(&raw, b"1001") && !contains(&raw, b"contacts"));
         assert_eq!(store.load_directory(), cache);
+    }
+
+    #[test]
+    fn own_contacts_are_stored_encrypted_in_sqlite() {
+        use crate::micollab::Phone;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).unwrap();
+        assert!(store.own_contacts().unwrap().is_empty());
+        let person = |first: &str, number: &str| Contact {
+            first_name: first.into(),
+            last_name: "Muster".into(),
+            phones: vec![Phone { number: number.into(), label: "Mobil".into() }],
+            ..Contact::default()
+        };
+        let (mut erika, mut max) = (person("Erika", "0170 1234567"), person("Max", "0171 7654321"));
+        store.save_own_contact(&mut erika).unwrap();
+        store.save_own_contact(&mut max).unwrap();
+        assert!(erika.id.starts_with("own-") && erika.id != max.id);
+
+        // Changing a saved contact keeps its id and adds no row.
+        erika.company = "Beispiel GmbH".into();
+        store.save_own_contact(&mut erika).unwrap();
+        drop(store);
+
+        let raw = std::fs::read(dir.path().join("history.db")).unwrap();
+        assert!(!contains(&raw, b"Erika") && !contains(&raw, b"0170") && !contains(&raw, b"Beispiel"));
+
+        let store = Store::open_in(dir.path()).unwrap();
+        assert_eq!(store.own_contacts().unwrap(), vec![erika.clone(), max.clone()]);
+        store.delete_own_contact(&erika.id).unwrap();
+        assert_eq!(store.own_contacts().unwrap(), vec![max]);
+        assert!(store.save_own_contact(&mut erika).is_err(), "a deleted contact is not silently recreated");
+        // Ids that are not ours are left alone.
+        store.delete_own_contact("c-1").unwrap();
+        assert_eq!(store.own_contacts().unwrap().len(), 1);
     }
 
     #[test]

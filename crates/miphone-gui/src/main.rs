@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui_material_icons::icons::{
-    ICON_BACKSPACE, ICON_CALL, ICON_CALL_MADE, ICON_CALL_MISSED, ICON_CALL_RECEIVED, ICON_CONTACTS, ICON_HISTORY, ICON_LOGOUT, ICON_REFRESH,
-    ICON_SETTINGS,
+    ICON_ADD, ICON_BACKSPACE, ICON_CALL, ICON_CALL_MADE, ICON_CALL_MISSED, ICON_CALL_RECEIVED, ICON_CONTACTS, ICON_EDIT, ICON_HISTORY, ICON_LOGOUT,
+    ICON_REFRESH, ICON_SETTINGS,
 };
 use egui_material_icons::{icon_text, MaterialIcon};
 use miphone::config::{MicollabConfig, SipConfig};
@@ -387,6 +387,81 @@ struct HistoryEntry {
     duration: Option<Duration>,
 }
 
+/// Which contacts the contact page lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContactTab {
+    /// The corporate directory from the server.
+    Company,
+    /// The contacts the user created, stored on this computer only.
+    Own,
+}
+
+/// Kinds of number an own contact can have, in the order of the form.
+const OWN_PHONE_LABELS: [&str; 3] = ["Geschäftlich", "Mobil", "Privat"];
+
+/// The form for creating or changing one of the user's own contacts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ContactForm {
+    /// Id of the contact being changed; empty for a new one.
+    id: String,
+    first_name: String,
+    last_name: String,
+    company: String,
+    department: String,
+    email: String,
+    /// Numbers in the order of `OWN_PHONE_LABELS`.
+    numbers: [String; 3],
+    /// The delete button was clicked once and asks for a second click.
+    confirm_delete: bool,
+}
+
+impl ContactForm {
+    fn edit(contact: &Contact) -> ContactForm {
+        let mut numbers: [String; 3] = Default::default();
+        for phone in &contact.phones {
+            // A number of a kind the form does not know takes the first free field.
+            let own_kind = OWN_PHONE_LABELS.iter().position(|label| *label == phone.label).filter(|i| numbers[*i].is_empty());
+            if let Some(index) = own_kind.or_else(|| numbers.iter().position(String::is_empty)) {
+                numbers[index] = phone.number.clone();
+            }
+        }
+        ContactForm {
+            id: contact.id.clone(),
+            first_name: contact.first_name.clone(),
+            last_name: contact.last_name.clone(),
+            company: contact.company.clone(),
+            department: contact.department.clone(),
+            email: contact.email.clone(),
+            numbers,
+            confirm_delete: false,
+        }
+    }
+
+    /// A contact needs a name to be found in the list.
+    fn complete(&self) -> bool {
+        !self.first_name.trim().is_empty() || !self.last_name.trim().is_empty()
+    }
+
+    fn contact(&self) -> Contact {
+        let phones = OWN_PHONE_LABELS
+            .iter()
+            .zip(&self.numbers)
+            .filter(|(_, number)| !number.trim().is_empty())
+            .map(|(label, number)| micollab::Phone { number: number.trim().to_string(), label: (*label).to_string() })
+            .collect();
+        Contact {
+            id: self.id.clone(),
+            first_name: self.first_name.trim().to_string(),
+            last_name: self.last_name.trim().to_string(),
+            company: self.company.trim().to_string(),
+            department: self.department.trim().to_string(),
+            email: self.email.trim().to_string(),
+            phones,
+            presence_id: None,
+        }
+    }
+}
+
 struct App {
     runtime: tokio::runtime::Runtime,
     theme: egui::ThemePreference,
@@ -440,6 +515,11 @@ struct App {
     contacts: Vec<Contact>,
     directory_timestamp: serde_json::Value,
     directory_loading: bool,
+    /// The contacts the user created, sorted by name.
+    own_contacts: Vec<Contact>,
+    contact_tab: ContactTab,
+    /// The form shown in place of the contact list while a contact is created or changed.
+    contact_form: Option<ContactForm>,
     groups: Vec<ContactGroup>,
     contact_search: String,
     /// Index into `groups` of the group shown; `None` shows everyone.
@@ -449,7 +529,7 @@ struct App {
     watchlist: Watchlist,
     watch_signal: Option<mpsc::UnboundedSender<()>>,
     refresh_directory: Option<mpsc::Sender<()>>,
-    /// Names from the directory by dialled digits, to show names instead of bare numbers.
+    /// Names of all contacts by dialled digits, to show names instead of bare numbers.
     names_by_number: HashMap<String, String>,
 }
 
@@ -615,6 +695,9 @@ impl App {
             contacts: Vec::new(),
             directory_timestamp: serde_json::Value::Null,
             directory_loading: false,
+            own_contacts: Vec::new(),
+            contact_tab: ContactTab::Company,
+            contact_form: None,
             groups: Vec::new(),
             contact_search: String::new(),
             contact_group: None,
@@ -624,7 +707,7 @@ impl App {
             refresh_directory: None,
             names_by_number: HashMap::new(),
         };
-        // `--demo[=call|incoming|history|settings|status|contacts|numbers|login|reset]` shows the main window with sample data
+        // `--demo[=call|incoming|history|settings|status|contacts|numbers|own|newcontact|login|reset]` shows the main window with sample data
         // and without any network connection, for working on the layout.
         match std::env::args().find_map(|a| a.strip_prefix("--demo").map(str::to_string)) {
             Some(demo) => app.enter_demo(demo.trim_start_matches('=')),
@@ -658,6 +741,7 @@ impl App {
         self.saved_password = settings.password;
         self.last_name_first = settings.last_name_first;
         self.history = store.recent_calls(HISTORY_SHOWN).unwrap_or_default().into_iter().map(HistoryEntry::from_record).collect();
+        self.set_own_contacts(store.own_contacts().unwrap_or_default());
         self.store = Some(store);
         self.store_usable = true;
         if let (true, Some(password)) = (self.login.stay_logged_in, self.saved_password.clone()) {
@@ -691,6 +775,9 @@ impl App {
         self.pending_password = None;
         self.history.clear();
         self.last_name_first = false;
+        self.contact_form = None;
+        self.contact_tab = ContactTab::Company;
+        self.set_own_contacts(Vec::new());
         self.set_contacts(Vec::new());
         self.directory_timestamp = serde_json::Value::Null;
         *self.audio.lock().unwrap() = Default::default();
@@ -753,6 +840,10 @@ impl App {
             person("c4", "Jonas", "Weber", "Technik", &["1004"]),
         ]);
         self.groups = vec![ContactGroup { name: "Favoriten".into(), members: vec!["c1".into(), "c4".into()] }];
+        self.set_own_contacts(vec![
+            Contact { company: "Beispiel Handwerk".into(), presence_id: None, ..person("own-1", "Petra", "Klein", "", &["030 5550100"]) },
+            Contact { presence_id: None, ..person("own-2", "Tom", "Berger", "", &[]) },
+        ]);
         let seen = |telephony: &str, external: &str, name: &str| Presence {
             telephony_state: telephony.into(),
             external_presence: external.into(),
@@ -778,6 +869,14 @@ impl App {
             "numbers" => {
                 self.page = Page::Contacts;
                 self.demo_number_menu = true;
+            }
+            "own" => {
+                self.page = Page::Contacts;
+                self.contact_tab = ContactTab::Own;
+            }
+            "newcontact" => {
+                self.page = Page::Contacts;
+                self.contact_form = Some(ContactForm::default());
             }
             "settings" => {
                 self.page = Page::Settings;
@@ -874,6 +973,9 @@ impl App {
         self.groups.clear();
         self.contact_group = None;
         self.contact_search.clear();
+        self.contact_form = None;
+        self.contact_tab = ContactTab::Company;
+        // The user's own contacts belong to this computer, not to the account, and stay.
         self.set_contacts(Vec::new());
         self.logged_in = false;
         self.login.busy = false;
@@ -892,13 +994,66 @@ impl App {
     /// Replaces the directory, keeping it sorted and the number lookup up to date.
     fn set_contacts(&mut self, mut contacts: Vec<Contact>) {
         sort_contacts(&mut contacts, self.last_name_first);
-        self.names_by_number = contacts
+        self.contacts = contacts;
+        self.rebuild_names();
+    }
+
+    /// Replaces the user's own contacts, keeping them sorted and the number lookup up to date.
+    fn set_own_contacts(&mut self, mut contacts: Vec<Contact>) {
+        sort_contacts(&mut contacts, self.last_name_first);
+        self.own_contacts = contacts;
+        self.rebuild_names();
+    }
+
+    /// Rebuilds the lookup of names by number. For a number in both lists the user's own
+    /// contact names it.
+    fn rebuild_names(&mut self) {
+        self.names_by_number = self
+            .contacts
             .iter()
+            .chain(&self.own_contacts)
             .filter(|c| !c.name().is_empty())
             .flat_map(|c| c.phones.iter().map(|p| (dial_key(&p.number), c.name())))
             .filter(|(key, _)| !key.is_empty())
             .collect();
-        self.contacts = contacts;
+    }
+
+    /// Stores the contact of the form and closes it; on failure the form stays open.
+    fn save_contact_form(&mut self) {
+        let Some(form) = &self.contact_form else { return };
+        let mut contact = form.contact();
+        self.ensure_store();
+        match &self.store {
+            Some(store) => {
+                if let Err(e) = store.save_own_contact(&mut contact) {
+                    self.status_line = format!("Kontakt konnte nicht gespeichert werden: {e:#}");
+                    return;
+                }
+            }
+            // Without a store the contact lives until the program ends.
+            None if contact.id.is_empty() => contact.id = format!("unsaved-{}", chrono::Local::now().timestamp_micros()),
+            None => {}
+        }
+        let mut contacts = std::mem::take(&mut self.own_contacts);
+        contacts.retain(|c| c.id != contact.id);
+        contacts.push(contact);
+        self.set_own_contacts(contacts);
+        self.contact_form = None;
+        self.contact_tab = ContactTab::Own;
+    }
+
+    /// Deletes the contact of the form and closes it; on failure the form stays open.
+    fn delete_contact_form(&mut self) {
+        let Some(id) = self.contact_form.as_ref().map(|form| form.id.clone()) else { return };
+        self.ensure_store();
+        if let Some(Err(e)) = self.store.as_ref().map(|s| s.delete_own_contact(&id)) {
+            self.status_line = format!("Kontakt konnte nicht gelöscht werden: {e:#}");
+            return;
+        }
+        let mut contacts = std::mem::take(&mut self.own_contacts);
+        contacts.retain(|c| c.id != id);
+        self.set_own_contacts(contacts);
+        self.contact_form = None;
     }
 
     /// Applies the result of a directory sync and stores it encrypted.
@@ -1472,8 +1627,12 @@ impl App {
     }
 
     fn contacts_page(&mut self, ui: &mut egui::Ui) {
+        if self.contact_form.is_some() {
+            self.contact_form_page(ui);
+            return;
+        }
         ui.horizontal(|ui| {
-            let width = ui.available_width() - 40.0;
+            let width = ui.available_width() - 78.0;
             ui.add(egui::TextEdit::singleline(&mut self.contact_search).hint_text("Name, Nummer, Abteilung ...").desired_width(width));
             let refresh = ui.add_enabled(!self.directory_loading, egui::Button::new(icon_text(ICON_REFRESH).size(18.0))).on_hover_text("Verzeichnis neu abgleichen");
             if refresh.clicked() {
@@ -1481,9 +1640,16 @@ impl App {
                     self.directory_loading = tx.try_send(()).is_ok();
                 }
             }
+            if ui.button(icon_text(ICON_ADD).size(18.0)).on_hover_text("Hinzufügen").clicked() {
+                self.contact_form = Some(ContactForm::default());
+            }
         });
-        if !self.groups.is_empty() {
-            ui.horizontal_wrapped(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.contact_tab, ContactTab::Company, "Firma");
+            ui.selectable_value(&mut self.contact_tab, ContactTab::Own, "Eigene");
+            // The groups of the server divide the corporate directory only.
+            if self.contact_tab == ContactTab::Company && !self.groups.is_empty() {
+                ui.separator();
                 if ui.add(egui::Button::selectable(self.contact_group.is_none(), "Alle")).clicked() {
                     self.contact_group = None;
                 }
@@ -1492,14 +1658,15 @@ impl App {
                         self.contact_group = Some(index);
                     }
                 }
-            });
-        }
+            }
+        });
         ui.separator();
 
+        let own = self.contact_tab == ContactTab::Own;
         let needle = self.contact_search.trim().to_lowercase();
-        let members = self.contact_group.and_then(|i| self.groups.get(i)).map(|g| &g.members);
-        let matching: Vec<usize> = self
-            .contacts
+        let list = if own { &self.own_contacts } else { &self.contacts };
+        let members = self.contact_group.and_then(|i| self.groups.get(i)).map(|g| &g.members).filter(|_| !own);
+        let matching: Vec<usize> = list
             .iter()
             .enumerate()
             .filter(|(_, c)| members.is_none_or(|m| m.contains(&c.id)) && contact_matches(c, &needle))
@@ -1507,21 +1674,24 @@ impl App {
             .collect();
         if matching.is_empty() {
             ui.add_space(8.0);
-            ui.label(match (self.contacts.is_empty(), self.directory_loading) {
-                (true, true) => "Verzeichnis wird geladen ...",
-                (true, false) => "Das Verzeichnis ist leer.",
-                (false, _) => "Keine Treffer.",
+            ui.label(match (list.is_empty(), own, self.directory_loading) {
+                (true, true, _) => "Noch keine eigenen Kontakte. Mit dem Plus oben legst du einen an.",
+                (true, false, true) => "Verzeichnis wird geladen ...",
+                (true, false, false) => "Das Verzeichnis ist leer.",
+                (false, ..) => "Keine Treffer.",
             });
             return;
         }
         // Only the presence of the contacts at the top of the list is asked for.
-        let wanted = matching.iter().take(PRESENCE_WATCHED).filter_map(|i| self.contacts[*i].presence_id.clone()).collect();
+        let wanted = matching.iter().take(PRESENCE_WATCHED).filter_map(|i| list[*i].presence_id.clone()).collect();
         self.watch(wanted);
 
+        let list = if own { &self.own_contacts } else { &self.contacts };
         let mut dial = None;
+        let mut edit = None;
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             for index in matching.iter().take(CONTACTS_SHOWN) {
-                let contact = &self.contacts[*index];
+                let contact = &list[*index];
                 let presence = contact.presence_id.as_ref().and_then(|id| self.contact_presence.get(&id.to_lowercase()));
                 ui.horizontal(|ui| {
                     let name = if self.last_name_first { contact.name_last_first() } else { contact.name() };
@@ -1555,6 +1725,9 @@ impl App {
                                 }
                             }
                         });
+                        if own && ui.button(icon_text(ICON_EDIT).size(18.0)).on_hover_text("Bearbeiten").clicked() {
+                            edit = Some(ContactForm::edit(contact));
+                        }
                     });
                 });
                 ui.separator();
@@ -1563,10 +1736,62 @@ impl App {
                 ui.label(egui::RichText::new(format!("{} weitere Kontakte – Suche verfeinern.", matching.len() - CONTACTS_SHOWN)).weak());
             }
         });
+        if edit.is_some() {
+            self.contact_form = edit;
+        }
         if let Some(number) = dial {
             self.dial = number;
             self.page = Page::Phone;
             self.place_call();
+        }
+    }
+
+    /// The form for one of the user's own contacts, shown in place of the list.
+    fn contact_form_page(&mut self, ui: &mut egui::Ui) {
+        let Some(form) = &mut self.contact_form else { return };
+        let (mut save, mut cancel, mut delete) = (false, false, false);
+        ui.heading(if form.id.is_empty() { "Neuer Kontakt" } else { "Kontakt bearbeiten" });
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            let complete = form.complete();
+            let [work, mobile, home] = &mut form.numbers;
+            let fields = [
+                ("Vorname", &mut form.first_name),
+                ("Nachname", &mut form.last_name),
+                ("Firma", &mut form.company),
+                ("Abteilung", &mut form.department),
+                ("E-Mail", &mut form.email),
+                ("Telefon geschäftlich", work),
+                ("Telefon mobil", mobile),
+                ("Telefon privat", home),
+            ];
+            egui::Grid::new("contact_form").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                for (label, value) in fields {
+                    ui.label(label);
+                    ui.add(egui::TextEdit::singleline(value).desired_width(240.0));
+                    ui.end_row();
+                }
+            });
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                save = ui.add_enabled(complete, egui::Button::new("Speichern")).on_disabled_hover_text("Vor- oder Nachname fehlt").clicked();
+                cancel = ui.button("Abbrechen").clicked();
+                if !form.id.is_empty() {
+                    ui.add_space(16.0);
+                    // Deleting takes a second click on the same button.
+                    if ui.button(if form.confirm_delete { "Wirklich löschen?" } else { "Löschen" }).clicked() {
+                        delete = form.confirm_delete;
+                        form.confirm_delete = true;
+                    }
+                }
+            });
+        });
+        if save {
+            self.save_contact_form();
+        } else if delete {
+            self.delete_contact_form();
+        } else if cancel {
+            self.contact_form = None;
         }
     }
 
@@ -1679,6 +1904,7 @@ impl App {
             ui.selectable_value(&mut self.last_name_first, true, "Nachname, Vorname");
             if self.last_name_first != before {
                 sort_contacts(&mut self.contacts, self.last_name_first);
+                sort_contacts(&mut self.own_contacts, self.last_name_first);
                 self.persist();
             }
         });
@@ -1834,6 +2060,32 @@ mod tests {
             phones: vec![micollab::Phone { number: number.into(), label: "Work".into() }],
             ..Contact::default()
         }
+    }
+
+    #[test]
+    fn contact_form_roundtrips() {
+        let form = ContactForm {
+            first_name: " Petra ".into(),
+            last_name: "Klein".into(),
+            company: "Beispiel Handwerk".into(),
+            email: "petra@example.org".into(),
+            numbers: ["".into(), " 0170 1234567 ".into(), "030 5550100".into()],
+            ..ContactForm::default()
+        };
+        assert!(form.complete() && !ContactForm { company: "Nur Firma".into(), ..ContactForm::default() }.complete());
+        let mut contact = form.contact();
+        assert_eq!((contact.name().as_str(), contact.id.as_str(), contact.presence_id.as_ref()), ("Petra Klein", "", None));
+        let phones: Vec<(&str, &str)> = contact.phones.iter().map(|p| (p.label.as_str(), p.number.as_str())).collect();
+        assert_eq!(phones, vec![("Mobil", "0170 1234567"), ("Privat", "030 5550100")], "empty numbers are left out");
+
+        // Opened again, every value is in its field and saving changes nothing.
+        contact.id = "own-7".into();
+        let again = ContactForm::edit(&contact);
+        assert_eq!((again.id.as_str(), again.first_name.as_str(), &again.numbers), ("own-7", "Petra", &["".to_string(), "0170 1234567".into(), "030 5550100".into()]));
+        assert_eq!(again.contact(), contact);
+        // Numbers of a kind the form does not know are kept in the free fields.
+        let foreign = Contact { phones: vec![contact.phones[0].clone(), micollab::Phone { number: "1001".into(), label: "Work".into() }], ..contact };
+        assert_eq!(ContactForm::edit(&foreign).numbers, ["1001".to_string(), "0170 1234567".into(), String::new()]);
     }
 
     #[test]
