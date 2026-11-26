@@ -437,6 +437,15 @@ impl ContactForm {
         }
     }
 
+    /// An empty form for a number that is not in the contacts yet.
+    fn for_number(number: &str) -> ContactForm {
+        let mut form = ContactForm::default();
+        // German mobile numbers start with 015, 016 or 017; everything else counts as business.
+        let mobile = ["015", "016", "017"].iter().any(|prefix| number_key(number).starts_with(prefix));
+        form.numbers[if mobile { 1 } else { 0 }] = number.trim().to_string();
+        form
+    }
+
     /// A contact needs a name to be found in the list.
     fn complete(&self) -> bool {
         !self.first_name.trim().is_empty() || !self.last_name.trim().is_empty()
@@ -520,6 +529,8 @@ struct App {
     contact_tab: ContactTab,
     /// The form shown in place of the contact list while a contact is created or changed.
     contact_form: Option<ContactForm>,
+    /// Number of a caller who is not in the contacts, offered for saving after the call.
+    save_offer: Option<String>,
     groups: Vec<ContactGroup>,
     contact_search: String,
     /// Index into `groups` of the group shown; `None` shows everyone.
@@ -718,6 +729,7 @@ impl App {
             own_contacts: Vec::new(),
             contact_tab: ContactTab::Company,
             contact_form: None,
+            save_offer: None,
             groups: Vec::new(),
             contact_search: String::new(),
             contact_group: None,
@@ -727,7 +739,7 @@ impl App {
             refresh_directory: None,
             names_by_number: HashMap::new(),
         };
-        // `--demo[=call|incoming|history|settings|status|contacts|numbers|own|newcontact|login|reset]` shows the main window with sample data
+        // `--demo[=call|incoming|history|settings|status|contacts|numbers|own|newcontact|savenumber|login|reset]` shows the main window with sample data
         // and without any network connection, for working on the layout.
         match std::env::args().find_map(|a| a.strip_prefix("--demo").map(str::to_string)) {
             Some(demo) => app.enter_demo(demo.trim_start_matches('=')),
@@ -796,6 +808,7 @@ impl App {
         self.history.clear();
         self.last_name_first = false;
         self.contact_form = None;
+        self.save_offer = None;
         self.contact_tab = ContactTab::Company;
         self.set_own_contacts(Vec::new());
         self.set_contacts(Vec::new());
@@ -898,6 +911,7 @@ impl App {
                 self.page = Page::Contacts;
                 self.contact_form = Some(ContactForm::default());
             }
+            "savenumber" => self.save_offer = Some("0170 7654321".into()),
             "settings" => {
                 self.page = Page::Settings;
                 self.can_switch_account = true;
@@ -994,6 +1008,7 @@ impl App {
         self.contact_group = None;
         self.contact_search.clear();
         self.contact_form = None;
+        self.save_offer = None;
         self.contact_tab = ContactTab::Company;
         // The user's own contacts belong to this computer, not to the account, and stay.
         self.set_contacts(Vec::new());
@@ -1100,6 +1115,44 @@ impl App {
         match self.names_by_number.get(&number_key(peer)) {
             Some(name) => format!("{name} ({peer})"),
             None => peer.to_string(),
+        }
+    }
+
+    /// Whether this is a number that no contact has. A caller without a number is not one.
+    fn unknown_number(&self, number: &str) -> bool {
+        let key = number_key(number);
+        key.chars().any(|c| c.is_ascii_digit()) && !self.names_by_number.contains_key(&key)
+    }
+
+    /// The small window over the page that offers to save the number of the last caller.
+    fn save_offer_window(&mut self, ctx: &egui::Context) {
+        let Some(number) = self.save_offer.clone() else { return };
+        // Saved in the meantime, by hand or by a directory sync: nothing left to offer.
+        if !self.unknown_number(&number) {
+            self.save_offer = None;
+            return;
+        }
+        let (mut save, mut dismiss) = (false, false);
+        egui::Window::new("Nummer speichern?")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(210.0)
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -36.0])
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(&number).strong());
+                ui.label("Nicht in den Kontakten.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    save = ui.button("Speichern").clicked();
+                    dismiss = ui.button("Nein").clicked();
+                });
+            });
+        if save {
+            self.contact_form = Some(ContactForm::for_number(&number));
+            self.page = Page::Contacts;
+        }
+        if save || dismiss {
+            self.save_offer = None;
         }
     }
 
@@ -1229,6 +1282,13 @@ impl App {
                     started: t.started,
                     duration: t.connected.map(|c| c.elapsed()),
                 };
+                // After a call that was taken, offer to save a caller the contacts do not know.
+                if entry.incoming && entry.answered {
+                    let number = number_of(&entry.peer);
+                    if self.unknown_number(&number) {
+                        self.save_offer = Some(number);
+                    }
+                }
                 self.ensure_store();
                 if let Some(Err(e)) = self.store.as_ref().map(|s| s.add_call(&entry.to_record())) {
                     self.status_line = format!("Verlauf konnte nicht gespeichert werden: {e:#}");
@@ -1463,6 +1523,8 @@ impl App {
             Page::History => self.history_page(ui),
             Page::Settings => self.settings_page(ui),
         });
+        let ctx = ui.ctx().clone();
+        self.save_offer_window(&ctx);
     }
 
     fn nav_entry(&mut self, ui: &mut egui::Ui, page: Page, icon: MaterialIcon, label: &str) {
@@ -2103,6 +2165,9 @@ mod tests {
         let again = ContactForm::edit(&contact);
         assert_eq!((again.id.as_str(), again.first_name.as_str(), &again.numbers), ("own-7", "Petra", &["".to_string(), "0170 1234567".into(), "030 5550100".into()]));
         assert_eq!(again.contact(), contact);
+        // A number to save goes to the field of its kind.
+        assert_eq!(ContactForm::for_number(" +49 170 1234567 ").numbers, [String::new(), "+49 170 1234567".into(), String::new()]);
+        assert_eq!(ContactForm::for_number("030 5550100").numbers, ["030 5550100".to_string(), String::new(), String::new()]);
         // Numbers of a kind the form does not know are kept in the free fields.
         let foreign = Contact { phones: vec![contact.phones[0].clone(), micollab::Phone { number: "1001".into(), label: "Work".into() }], ..contact };
         assert_eq!(ContactForm::edit(&foreign).numbers, ["1001".to_string(), "0170 1234567".into(), String::new()]);
