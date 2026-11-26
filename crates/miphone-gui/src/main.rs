@@ -433,6 +433,9 @@ struct App {
     demo_status_menu: bool,
     /// Demo mode only: show the number menu of a contact opened.
     demo_number_menu: bool,
+    /// Show contacts as "Last, First" sorted by last name instead of "First Last" sorted by
+    /// first name.
+    last_name_first: bool,
     /// The corporate directory, sorted by name, and the marker for syncing changes.
     contacts: Vec<Contact>,
     directory_timestamp: serde_json::Value,
@@ -460,6 +463,18 @@ fn dial_key(number: &str) -> String {
     number.chars().filter(|c| c.is_ascii_digit() || *c == '+').collect()
 }
 
+/// Sorts by the name part that is shown first, then by the other one.
+fn sort_contacts(contacts: &mut [Contact], last_name_first: bool) {
+    contacts.sort_by_cached_key(|c| {
+        let (first, last) = (c.first_name.trim().to_lowercase(), c.last_name.trim().to_lowercase());
+        if last_name_first {
+            (last, first)
+        } else {
+            (first, last)
+        }
+    });
+}
+
 fn contact_matches(contact: &Contact, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
@@ -467,6 +482,7 @@ fn contact_matches(contact: &Contact, needle: &str) -> bool {
     let digits = dial_key(needle);
     [&contact.first_name, &contact.last_name, &contact.company, &contact.department, &contact.email].iter().any(|f| f.to_lowercase().contains(needle))
         || contact.name().to_lowercase().contains(needle)
+        || contact.name_last_first().to_lowercase().contains(needle)
         || (!digits.is_empty() && contact.phones.iter().any(|p| dial_key(&p.number).contains(&digits)))
 }
 
@@ -595,6 +611,7 @@ impl App {
             saved_password: None,
             demo_status_menu: false,
             demo_number_menu: false,
+            last_name_first: false,
             contacts: Vec::new(),
             directory_timestamp: serde_json::Value::Null,
             directory_loading: false,
@@ -639,6 +656,7 @@ impl App {
         self.login.number = settings.number;
         self.login.teleworker = settings.teleworker;
         self.saved_password = settings.password;
+        self.last_name_first = settings.last_name_first;
         self.history = store.recent_calls(HISTORY_SHOWN).unwrap_or_default().into_iter().map(HistoryEntry::from_record).collect();
         self.store = Some(store);
         self.store_usable = true;
@@ -672,6 +690,7 @@ impl App {
         self.saved_password = None;
         self.pending_password = None;
         self.history.clear();
+        self.last_name_first = false;
         self.set_contacts(Vec::new());
         self.directory_timestamp = serde_json::Value::Null;
         *self.audio.lock().unwrap() = Default::default();
@@ -694,6 +713,7 @@ impl App {
             theme: theme_name(self.theme).to_string(),
             audio_input: devices.input,
             audio_output: devices.output,
+            last_name_first: self.last_name_first,
         };
         if let Err(e) = store.save_settings(&settings) {
             self.status_line = format!("Speichern fehlgeschlagen: {e:#}");
@@ -871,7 +891,7 @@ impl App {
 
     /// Replaces the directory, keeping it sorted and the number lookup up to date.
     fn set_contacts(&mut self, mut contacts: Vec<Contact>) {
-        contacts.sort_by_cached_key(|c| (c.last_name.to_lowercase(), c.first_name.to_lowercase()));
+        sort_contacts(&mut contacts, self.last_name_first);
         self.names_by_number = contacts
             .iter()
             .filter(|c| !c.name().is_empty())
@@ -1504,8 +1524,8 @@ impl App {
                 let contact = &self.contacts[*index];
                 let presence = contact.presence_id.as_ref().and_then(|id| self.contact_presence.get(&id.to_lowercase()));
                 ui.horizontal(|ui| {
-                    let name = contact.name();
-                    avatar_widget(ui, 30.0, &initials(&name), presence.map(|p| indicator_dot(p.indicator())), egui::Sense::hover());
+                    let name = if self.last_name_first { contact.name_last_first() } else { contact.name() };
+                    avatar_widget(ui, 30.0, &initials(&contact.name()), presence.map(|p| indicator_dot(p.indicator())), egui::Sense::hover());
                     ui.vertical(|ui| {
                         ui.label(egui::RichText::new(if name.is_empty() { "(ohne Namen)" } else { &name }).strong());
                         let details: Vec<&str> = [contact.department.as_str(), contact.company.as_str()].into_iter().filter(|d| !d.is_empty()).collect();
@@ -1650,6 +1670,19 @@ impl App {
                 self.persist();
             }
         });
+        ui.add_space(16.0);
+
+        ui.label(egui::RichText::new("Kontakte").strong());
+        ui.horizontal(|ui| {
+            let before = self.last_name_first;
+            ui.selectable_value(&mut self.last_name_first, false, "Vorname Nachname");
+            ui.selectable_value(&mut self.last_name_first, true, "Nachname, Vorname");
+            if self.last_name_first != before {
+                sort_contacts(&mut self.contacts, self.last_name_first);
+                self.persist();
+            }
+        });
+        ui.label(egui::RichText::new("Anzeige und Sortierung der Kontaktliste.").weak().small());
         ui.add_space(16.0);
 
         ui.label(egui::RichText::new("Audio").strong());
@@ -1812,7 +1845,18 @@ mod tests {
         for needle in ["max", "technik", "999"] {
             assert!(!contact_matches(&c, needle), "{needle:?} should not match");
         }
+        assert!(contact_matches(&c, "muster, er"));
         assert_eq!(dial_key("+49 (30) 12-34"), "+49301234");
+    }
+
+    #[test]
+    fn sorts_contacts_by_the_part_shown_first() {
+        let mut list = vec![contact("Zoe", "Adler", "1"), contact("anna", "Zimmer", "2"), contact("Anna", "Berg", "3")];
+        let order = |l: &[Contact]| l.iter().map(|c| c.phones[0].number.clone()).collect::<String>();
+        sort_contacts(&mut list, false);
+        assert_eq!(order(&list), "321");
+        sort_contacts(&mut list, true);
+        assert_eq!(order(&list), "132");
     }
 
     #[test]

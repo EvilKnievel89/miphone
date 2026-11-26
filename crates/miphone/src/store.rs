@@ -35,6 +35,9 @@ pub struct Settings {
     /// Chosen sound devices by name; `None` is the system default.
     pub audio_input: Option<String>,
     pub audio_output: Option<String>,
+    /// Contact list as "Last, First" sorted by last name instead of "First Last" sorted by
+    /// first name.
+    pub last_name_first: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +234,7 @@ mod tests {
             theme: "dark".into(),
             audio_input: Some("Headset Mikrofon".into()),
             audio_output: None,
+            last_name_first: true,
         };
         store.save_settings(&settings).unwrap();
         let raw = std::fs::read(dir.path().join("settings.dat")).unwrap();

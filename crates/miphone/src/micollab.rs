@@ -67,6 +67,15 @@ impl Contact {
         format!("{} {}", self.first_name, self.last_name).trim().to_string()
     }
 
+    /// "Last, First", or whichever part exists.
+    pub fn name_last_first(&self) -> String {
+        match (self.last_name.trim(), self.first_name.trim()) {
+            ("", first) => first.to_string(),
+            (last, "") => last.to_string(),
+            (last, first) => format!("{last}, {first}"),
+        }
+    }
+
     fn parse(v: &Value) -> Option<Contact> {
         let text = |key: &str| v.get(key).and_then(Value::as_str).unwrap_or("").trim().to_string();
         let id = id_text(v.get("id")?)?;
@@ -358,6 +367,7 @@ mod tests {
         assert_eq!(erika.phones, vec![Phone { number: "1001".into(), label: "Work".into() }], "unpublished, duplicate and empty numbers are dropped");
         assert_eq!(erika.presence_id.as_deref(), Some("erika@example.org@mc.example.org"));
         assert_eq!((list[1].id.as_str(), list[1].name().as_str(), list[1].email.as_str()), ("7", "Nur Nachname", "n@example.org"));
+        assert_eq!((erika.name_last_first().as_str(), list[1].name_last_first().as_str()), ("Muster, Erika", "Nur Nachname"));
         assert_eq!(list[1].phones[0].number, "+49 30 1");
         // A single contact may arrive without the array.
         assert_eq!(parse_contacts(&json!({"contact":{"id":"x","lastName":"Solo"}})).len(), 1);
