@@ -1,5 +1,7 @@
-The ringtones in this folder are sound effects from Pixabay (https://pixabay.com),
-for example https://pixabay.com/sound-effects/musical-ringtone-030-437513/
+The ringtones in this folder are sound effects from Pixabay (https://pixabay.com):
+
+ringtone-030.mp3  https://pixabay.com/sound-effects/musical-ringtone-030-437513/
+ringtone-091.mp3  https://pixabay.com/sound-effects/technologie-ringtone-091-496417/
 
 They are not covered by the MIT license of this project. They are used under the
 Pixabay Content License (https://pixabay.com/service/license-summary/), which
