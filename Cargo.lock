@@ -2264,7 +2264,7 @@ dependencies = [
 
 [[package]]
 name = "miphone"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "aes",
  "anyhow",
@@ -2292,7 +2292,7 @@ dependencies = [
 
 [[package]]
 name = "miphone-gui"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2306,7 +2306,7 @@ dependencies = [
 
 [[package]]
 name = "misip"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "md-5",
  "rand",
