@@ -62,7 +62,7 @@ the original client off before using this one.
 
 `miphone-gui.exe --demo` opens the window with sample data and without any network
 connection, which is useful when working on the layout. Variants: `--demo=call`,
-`incoming`, `history`, `settings`, `status`, `contacts`, `numbers`, `own`, `newcontact`, `savenumber`,
+`incoming`, `history`, `settings`, `status`, `contacts`, `numbers`, `own`, `newcontact`, `savenumber`, `missed`,
 `login`, `reset`.
 
 ## Using the command line version

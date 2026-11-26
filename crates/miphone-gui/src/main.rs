@@ -501,6 +501,8 @@ struct App {
     dial: String,
     tracked: Option<Tracked>,
     history: Vec<HistoryEntry>,
+    /// Calls missed since the history page was last looked at, shown as a badge on its icon.
+    missed_calls: usize,
     audio: AudioSettings,
     inputs: Vec<String>,
     outputs: Vec<String>,
@@ -713,6 +715,7 @@ impl App {
             dial: String::new(),
             tracked: None,
             history: Vec::new(),
+            missed_calls: 0,
             audio: AudioSettings::default(),
             inputs,
             outputs,
@@ -739,7 +742,7 @@ impl App {
             refresh_directory: None,
             names_by_number: HashMap::new(),
         };
-        // `--demo[=call|incoming|history|settings|status|contacts|numbers|own|newcontact|savenumber|login|reset]` shows the main window with sample data
+        // `--demo[=call|incoming|history|settings|status|contacts|numbers|own|newcontact|savenumber|missed|login|reset]` shows the main window with sample data
         // and without any network connection, for working on the layout.
         match std::env::args().find_map(|a| a.strip_prefix("--demo").map(str::to_string)) {
             Some(demo) => app.enter_demo(demo.trim_start_matches('=')),
@@ -806,6 +809,7 @@ impl App {
         self.saved_password = None;
         self.pending_password = None;
         self.history.clear();
+        self.missed_calls = 0;
         self.last_name_first = false;
         self.contact_form = None;
         self.save_offer = None;
@@ -912,6 +916,7 @@ impl App {
                 self.contact_form = Some(ContactForm::default());
             }
             "savenumber" => self.save_offer = Some("0170 7654321".into()),
+            "missed" => self.missed_calls = 2,
             "settings" => {
                 self.page = Page::Settings;
                 self.can_switch_account = true;
@@ -1017,6 +1022,7 @@ impl App {
         self.number = None;
         self.state = Snapshot::default();
         self.tracked = None;
+        self.missed_calls = 0;
         self.status_line.clear();
         self.page = Page::Phone;
     }
@@ -1282,6 +1288,10 @@ impl App {
                     started: t.started,
                     duration: t.connected.map(|c| c.elapsed()),
                 };
+                // A missed call is counted unless the history is on screen and shows it anyway.
+                if entry.incoming && !entry.answered && self.page != Page::History {
+                    self.missed_calls += 1;
+                }
                 // After a call that was taken, offer to save a caller the contacts do not know.
                 if entry.incoming && entry.answered {
                     let number = number_of(&entry.peer);
@@ -1528,7 +1538,19 @@ impl App {
     }
 
     fn nav_entry(&mut self, ui: &mut egui::Ui, page: Page, icon: MaterialIcon, label: &str) {
-        if nav_button(ui, self.page == page, icon, label).clicked() {
+        // Looking at the history takes note of the missed calls.
+        if self.page == Page::History {
+            self.missed_calls = 0;
+        }
+        let button = nav_button(ui, self.page == page, icon, label);
+        if page == Page::History && self.missed_calls > 0 {
+            // A red badge with the number of missed calls on the corner of the icon.
+            let centre = button.rect.right_top() + egui::vec2(-9.0, 9.0);
+            let count = if self.missed_calls > 9 { "9+".to_string() } else { self.missed_calls.to_string() };
+            ui.painter().circle_filled(centre, 8.0, egui::Color32::from_rgb(210, 60, 55));
+            ui.painter().text(centre, egui::Align2::CENTER_CENTER, count, egui::FontId::proportional(10.5), egui::Color32::WHITE);
+        }
+        if button.clicked() {
             self.page = page;
         }
     }
