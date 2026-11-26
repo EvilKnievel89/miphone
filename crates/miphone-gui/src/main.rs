@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("miphone")
+            .with_title(concat!("miphone ", env!("CARGO_PKG_VERSION")))
             .with_inner_size([400.0 * UI_SCALE, 660.0 * UI_SCALE])
             .with_min_inner_size([360.0 * UI_SCALE, 560.0 * UI_SCALE])
             .with_icon(window_icon()),
