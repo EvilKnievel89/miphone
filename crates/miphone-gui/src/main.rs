@@ -543,6 +543,25 @@ fn dial_key(number: &str) -> String {
     number.chars().filter(|c| c.is_ascii_digit() || *c == '+').collect()
 }
 
+/// Country code of the numbers the telephone system treats as national.
+const COUNTRY_CODE: &str = "49";
+
+/// A number in the one form used to compare it with others. Depending on its
+/// configuration the telephone system reports the same national number as `+49 170 ...`,
+/// `0049 170 ...` or `00170 ...` (outside line and national prefix), and contacts are
+/// written in any of these or simply as `0170 ...`; all become `0170...`.
+fn number_key(number: &str) -> String {
+    let digits = dial_key(number);
+    let national = digits
+        .strip_prefix(&format!("+{COUNTRY_CODE}"))
+        .or_else(|| digits.strip_prefix(&format!("00{COUNTRY_CODE}")))
+        .or_else(|| digits.strip_prefix("00"));
+    match national {
+        Some(rest) if !rest.is_empty() => format!("0{}", rest.trim_start_matches('0')),
+        _ => digits,
+    }
+}
+
 /// Sorts by the name part that is shown first, then by the other one.
 fn sort_contacts(contacts: &mut [Contact], last_name_first: bool) {
     contacts.sort_by_cached_key(|c| {
@@ -559,11 +578,12 @@ fn contact_matches(contact: &Contact, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
-    let digits = dial_key(needle);
+    // Digits typed are looked for in the numbers as written and in their common form.
+    let (digits, key) = (dial_key(needle), number_key(needle));
     [&contact.first_name, &contact.last_name, &contact.company, &contact.department, &contact.email].iter().any(|f| f.to_lowercase().contains(needle))
         || contact.name().to_lowercase().contains(needle)
         || contact.name_last_first().to_lowercase().contains(needle)
-        || (!digits.is_empty() && contact.phones.iter().any(|p| dial_key(&p.number).contains(&digits)))
+        || (!digits.is_empty() && contact.phones.iter().any(|p| dial_key(&p.number).contains(&digits) || number_key(&p.number).contains(&key)))
 }
 
 /// Colour of a presence dot and whether it blinks.
@@ -1013,7 +1033,7 @@ impl App {
             .iter()
             .chain(&self.own_contacts)
             .filter(|c| !c.name().is_empty())
-            .flat_map(|c| c.phones.iter().map(|p| (dial_key(&p.number), c.name())))
+            .flat_map(|c| c.phones.iter().map(|p| (number_key(&p.number), c.name())))
             .filter(|(key, _)| !key.is_empty())
             .collect();
     }
@@ -1077,7 +1097,7 @@ impl App {
         if peer.contains('(') {
             return peer.to_string(); // already "Name (number)"
         }
-        match self.names_by_number.get(&dial_key(peer)) {
+        match self.names_by_number.get(&number_key(peer)) {
             Some(name) => format!("{name} ({peer})"),
             None => peer.to_string(),
         }
@@ -2099,6 +2119,23 @@ mod tests {
         }
         assert!(contact_matches(&c, "muster, er"));
         assert_eq!(dial_key("+49 (30) 12-34"), "+49301234");
+    }
+
+    #[test]
+    fn compares_numbers_written_differently() {
+        // One national number in every form a telephone system or a contact may use.
+        for written in ["+49 170 1234567", "0049 170 1234567", "00170 1234567", "0170 1234567", "+49 (0) 170 1234567", "0170/123-4567"] {
+            assert_eq!(number_key(written), "01701234567", "{written}");
+        }
+        // Extensions, short numbers and numbers of other countries stay as they are.
+        for (written, key) in [("1001", "1001"), ("8*1002", "81002"), ("0", "0"), ("00", "00"), ("110", "110"), ("+33 1 23 45", "+3312345"), ("", "")] {
+            assert_eq!(number_key(written), key, "{written}");
+        }
+        // A contact saved with +49 is found by a search in the national form and the other way round.
+        let c = contact("Erika", "Muster", "+49 170 1234567");
+        assert!(contact_matches(&c, "0170 123") && contact_matches(&c, "+49170") && contact_matches(&c, "4567"));
+        assert!(contact_matches(&contact("Max", "Beispiel", "0170 1234567"), "+49 170 12"));
+        assert!(!contact_matches(&c, "0171"));
     }
 
     #[test]
