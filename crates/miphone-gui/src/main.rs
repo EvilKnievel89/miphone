@@ -111,6 +111,8 @@ enum Backend {
     Directory { contacts: Vec<Contact>, deleted: Vec<String>, timestamp: serde_json::Value, full: bool },
     Groups(Vec<ContactGroup>),
     DirectoryError(String),
+    /// The softphone signed off at the telephone system for good.
+    SignedOff,
 }
 
 /// One of the user's contact groups with the ids of its members.
@@ -351,6 +353,7 @@ async fn session(
         if quit {
             // The softphone signed off: either for good or to register with the other account.
             if !(switch_account.swap(false, Ordering::SeqCst) && profile.switch()) {
+                notify.send(Backend::SignedOff);
                 return;
             }
             cfg.use_account(&profile.account);
@@ -532,6 +535,10 @@ struct App {
     ring_preview: bool,
     /// Demo mode shows calls that are not there and does not ring for them.
     demo: bool,
+    /// The window is closing: when the user asked for it, and when the softphone had signed
+    /// off. Until then a notice is shown instead of a window that seems to hang.
+    closing: Option<Instant>,
+    signed_off: Option<Instant>,
     inputs: Vec<String>,
     outputs: Vec<String>,
     /// Encrypted storage; `None` if it could not be opened (then nothing is saved) or after
@@ -573,6 +580,11 @@ struct App {
     /// Names of all contacts by dialled digits, to show names instead of bare numbers.
     names_by_number: HashMap<String, String>,
 }
+
+/// How long the window stays open after the softphone signed off, for the rest of the sign-off.
+const CLOSE_GRACE: Duration = Duration::from_millis(400);
+/// The window closes after this time even if the sign-off got no answer.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Volume of the ringtone in percent until the user chooses one.
 const DEFAULT_RING_VOLUME: u8 = 70;
@@ -754,6 +766,8 @@ impl App {
             ringer: None,
             ring_preview: false,
             demo: false,
+            closing: None,
+            signed_off: None,
             inputs,
             outputs,
             store: None,
@@ -779,7 +793,7 @@ impl App {
             refresh_directory: None,
             names_by_number: HashMap::new(),
         };
-        // `--demo[=call|incoming|history|settings|status|contacts|numbers|own|newcontact|savenumber|missed|login|reset]` shows the main window with sample data
+        // `--demo[=call|incoming|history|settings|status|contacts|numbers|own|newcontact|savenumber|missed|closing|login|reset]` shows the main window with sample data
         // and without any network connection, for working on the layout.
         match std::env::args().find_map(|a| a.strip_prefix("--demo").map(str::to_string)) {
             Some(demo) => app.enter_demo(demo.trim_start_matches('=')),
@@ -965,6 +979,7 @@ impl App {
             }
             "savenumber" => self.save_offer = Some("0170 7654321".into()),
             "missed" => self.missed_calls = 2,
+            "closing" => self.closing = Some(Instant::now()),
             "settings" => {
                 self.page = Page::Settings;
                 self.can_switch_account = true;
@@ -1172,10 +1187,49 @@ impl App {
         }
     }
 
+    /// Closing the window signs off like "Abmelden", which takes a moment. The window stays
+    /// open with a notice until that is done, so it does not look as if nothing happened.
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) && self.closing.is_none() && self.logged_in && self.commands.is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.closing = Some(Instant::now());
+            self.send(Command::Quit);
+        }
+        // A second request to close, by us below or by an impatient user, goes through.
+        let Some(since) = self.closing else { return };
+        if self.demo {
+            return; // the demo only shows the notice
+        }
+        // After the telephone system, the MiCollab server is told as well; leave it a moment.
+        let done = self.signed_off.is_some_and(|at| at.elapsed() >= CLOSE_GRACE) || since.elapsed() >= CLOSE_TIMEOUT;
+        if done {
+            self.commands = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
+    /// The notice in the middle of the window while it is closing.
+    fn closing_notice(&self, ctx: &egui::Context) {
+        if self.closing.is_none() {
+            return;
+        }
+        egui::Modal::new(egui::Id::unique("closing")).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                ui.add(egui::Spinner::new().size(22.0));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Wird beendet ...").size(16.0));
+                ui.add_space(6.0);
+            });
+        });
+    }
+
     /// Starts and stops the ringtone: it plays while a call rings here and while the user
     /// listens to it in the settings.
     fn update_ringer(&mut self) {
-        let incoming = self.state.call.as_ref().is_some_and(|call| call.phase == CallPhase::Incoming) && !self.demo;
+        let incoming = self.state.call.as_ref().is_some_and(|call| call.phase == CallPhase::Incoming) && !self.demo && self.closing.is_none();
         if self.page != Page::Settings || !self.logged_in {
             self.ring_preview = false;
         }
@@ -1302,6 +1356,7 @@ impl App {
                     self.groups = groups;
                     self.contact_group = self.contact_group.filter(|i| *i < self.groups.len());
                 }
+                Backend::SignedOff => self.signed_off = Some(Instant::now()),
                 Backend::DirectoryError(text) => {
                     self.directory_loading = false;
                     self.status_line = format!("Verzeichnis: {text}");
@@ -2238,6 +2293,7 @@ fn number_of(peer: &str) -> String {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_backend(ctx);
+        self.handle_close(ctx);
         self.update_ringer();
     }
 
@@ -2247,10 +2303,12 @@ impl eframe::App for App {
         } else {
             self.login_screen(ui);
         }
+        self.closing_notice(ui.ctx());
     }
 
     fn on_exit(&mut self) {
-        // Closing the window signs off like "Abmelden"; give the server a moment to answer.
+        // Normally the sign-off is through by now, see `handle_close`. This is for a window
+        // closed in another way, e.g. during login: sign off and give the server a moment.
         if self.commands.is_some() {
             self.send(Command::Quit);
             std::thread::sleep(Duration::from_millis(1500));

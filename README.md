@@ -68,7 +68,7 @@ used side by side. The name may contain letters, digits, `-` and `_`.
 
 `miphone-gui.exe --demo` opens the window with sample data and without any network
 connection, which is useful when working on the layout. Variants: `--demo=call`,
-`incoming`, `history`, `settings`, `status`, `contacts`, `numbers`, `own`, `newcontact`, `savenumber`, `missed`,
+`incoming`, `history`, `settings`, `status`, `contacts`, `numbers`, `own`, `newcontact`, `savenumber`, `missed`, `closing`,
 `login`, `reset`.
 
 ## Using the command line version
