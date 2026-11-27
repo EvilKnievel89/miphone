@@ -13,6 +13,7 @@ futures-util = "0.3.34"
 httpdate = "1.0.3"
 misip = { version = "0.2.1-pre.2", path = "../misip" }
 native-tls = "0.2.18"
+nnnoiseless = { version = "0.5.2", default-features = false }
 opus = "0.4.0"
 rand = "0.10.4"
 reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "json"] }

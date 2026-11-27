@@ -4,6 +4,7 @@
 //! every 20 ms and one receiving. The buffers between sound card and network hold mono
 //! samples at the codec's rate: 8 kHz for G.711, 16 kHz for Opus.
 
+use nnnoiseless::DenoiseState;
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -23,13 +24,23 @@ const OPUS_BITRATE: i32 = 16000;
 const OPUS_MAX_FRAME: usize = 1920;
 
 /// Sound devices to use for calls, by name. `None` means the system default.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioDevices {
     pub input: Option<String>,
     pub output: Option<String>,
+    /// Background noise is taken out of the microphone's sound. Unlike the devices, this
+    /// also takes effect during a call.
+    pub noise_suppression: bool,
 }
 
-/// Device choice shared with the user interface; read at the start of each call.
+impl Default for AudioDevices {
+    fn default() -> AudioDevices {
+        AudioDevices { input: None, output: None, noise_suppression: true }
+    }
+}
+
+/// Device choice shared with the user interface; the devices are read at the start of each
+/// call.
 pub type AudioSettings = Arc<Mutex<AudioDevices>>;
 
 /// Names of the available input and output devices.
@@ -139,9 +150,9 @@ impl Media {
             playback: Mutex::new(VecDeque::new()),
         });
         if let Some(settings) = audio {
-            let devices = settings.lock().unwrap().clone();
+            let settings = settings.clone();
             let s = shared.clone();
-            std::thread::spawn(move || audio_thread(s, devices));
+            std::thread::spawn(move || audio_thread(s, settings));
         }
         let s = shared.clone();
         std::thread::spawn(move || send_thread(s));
@@ -332,7 +343,8 @@ fn receive_thread(sh: Arc<Shared>) {
 }
 
 /// Opens the default input and output devices and keeps the streams alive until the call ends.
-fn audio_thread(sh: Arc<Shared>, devices: AudioDevices) {
+fn audio_thread(sh: Arc<Shared>, settings: AudioSettings) {
+    let devices = settings.lock().unwrap().clone();
     let host = cpal::default_host();
     let output = match open_output(&host, sh.clone(), devices.output.as_deref()) {
         Ok(s) => Some(s),
@@ -341,7 +353,7 @@ fn audio_thread(sh: Arc<Shared>, devices: AudioDevices) {
             None
         }
     };
-    let input = match open_input(&host, sh.clone(), devices.input.as_deref()) {
+    let input = match open_input(&host, sh.clone(), devices.input.as_deref(), settings) {
         Ok(s) => Some(s),
         Err(e) => {
             eprintln!("Mikrofon nicht verfuegbar: {e}");
@@ -372,16 +384,16 @@ fn open_output(host: &cpal::Host, sh: Arc<Shared>, name: Option<&str>) -> anyhow
     Ok(stream)
 }
 
-fn open_input(host: &cpal::Host, sh: Arc<Shared>, name: Option<&str>) -> anyhow::Result<cpal::Stream> {
+fn open_input(host: &cpal::Host, sh: Arc<Shared>, name: Option<&str>, settings: AudioSettings) -> anyhow::Result<cpal::Stream> {
     let chosen = name.and_then(|n| host.input_devices().ok()?.find(|d| device_name(d).as_deref() == Some(n)));
     let device = chosen.or_else(|| host.default_input_device()).ok_or_else(|| anyhow::anyhow!("kein Eingabegeraet"))?;
     let supported = device.default_input_config()?;
     let format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
     let stream = match format {
-        cpal::SampleFormat::F32 => build_input::<f32>(&device, &config, sh)?,
-        cpal::SampleFormat::I16 => build_input::<i16>(&device, &config, sh)?,
-        cpal::SampleFormat::U16 => build_input::<u16>(&device, &config, sh)?,
+        cpal::SampleFormat::F32 => build_input::<f32>(&device, &config, sh, settings)?,
+        cpal::SampleFormat::I16 => build_input::<i16>(&device, &config, sh, settings)?,
+        cpal::SampleFormat::U16 => build_input::<u16>(&device, &config, sh, settings)?,
         other => anyhow::bail!("nicht unterstuetztes Eingabeformat {other:?}"),
     };
     stream.play()?;
@@ -528,8 +540,73 @@ where
     Ok(stream)
 }
 
-/// Capture: the first channel is converted to the codec rate.
-fn build_input<T>(device: &cpal::Device, config: &cpal::StreamConfig, sh: Arc<Shared>) -> anyhow::Result<cpal::Stream>
+/// The rate the noise suppression works at.
+const DENOISE_RATE: u32 = 48000;
+
+/// The way of the microphone's sound to the codec: to 48 kHz, through the noise suppression
+/// (RNNoise) if it is on, then to the rate of the codec.
+struct Capture {
+    /// Not needed for a device that runs at 48 kHz.
+    to_48k: Option<Resampler>,
+    to_codec: Resampler,
+    codec_rate: u32,
+    denoise: Box<DenoiseState<'static>>,
+    /// Sound at 48 kHz waiting to fill a frame of the noise suppression, in its scale (16 bit).
+    frame: Vec<f32>,
+    cleaned: [f32; DenoiseState::FRAME_SIZE],
+    at_48k: Vec<f32>,
+}
+
+impl Capture {
+    fn new(device_rate: u32, codec_rate: u32) -> Capture {
+        Capture {
+            to_48k: (device_rate != DENOISE_RATE).then(|| Resampler::new(device_rate, DENOISE_RATE)),
+            to_codec: Resampler::new(DENOISE_RATE, codec_rate),
+            codec_rate,
+            denoise: DenoiseState::new(),
+            frame: Vec::with_capacity(DenoiseState::FRAME_SIZE),
+            cleaned: [0.0; DenoiseState::FRAME_SIZE],
+            at_48k: Vec::new(),
+        }
+    }
+
+    /// Takes one sample of the device (between -1 and 1) and appends to `out` what is due
+    /// at the rate of the codec.
+    fn feed(&mut self, sample: f32, codec_rate: u32, suppress_noise: bool, out: &mut VecDeque<i16>) {
+        if codec_rate != self.codec_rate {
+            self.codec_rate = codec_rate;
+            self.to_codec = Resampler::new(DENOISE_RATE, codec_rate);
+        }
+        let Capture { to_48k, to_codec, denoise, frame, cleaned, at_48k, .. } = self;
+        at_48k.clear();
+        match to_48k {
+            Some(resampler) => resampler.push(sample, |v| at_48k.push(v)),
+            None => at_48k.push(sample),
+        }
+        let mut emit = |v: f32| out.push_back((v.clamp(-1.0, 1.0) * 32767.0) as i16);
+        for &v in at_48k.iter() {
+            if suppress_noise {
+                frame.push(v * 32768.0);
+                if frame.len() == DenoiseState::FRAME_SIZE {
+                    denoise.process_frame(cleaned, frame);
+                    frame.clear();
+                    for cleaned in cleaned.iter() {
+                        to_codec.push(cleaned / 32768.0, &mut emit);
+                    }
+                }
+            } else {
+                // Switched off in the middle of a frame: what waited goes out as it is.
+                for waiting in frame.drain(..) {
+                    to_codec.push(waiting / 32768.0, &mut emit);
+                }
+                to_codec.push(v, &mut emit);
+            }
+        }
+    }
+}
+
+/// Capture: the first channel goes through the noise suppression and to the codec rate.
+fn build_input<T>(device: &cpal::Device, config: &cpal::StreamConfig, sh: Arc<Shared>, settings: AudioSettings) -> anyhow::Result<cpal::Stream>
 where
     T: cpal::SizedSample,
     f32: cpal::FromSample<T>,
@@ -537,19 +614,20 @@ where
     use cpal::Sample;
     let channels = config.channels as usize;
     let device_rate = sample_rate_hz(config);
-    let mut codec_rate = sh.rate.load(Ordering::Relaxed);
-    let mut resampler = Resampler::new(device_rate, codec_rate);
+    let mut capture = Capture::new(device_rate, sh.rate.load(Ordering::Relaxed));
+    let mut suppress_noise = settings.lock().unwrap().noise_suppression;
     let stream = device.build_input_stream(
         *config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
             let rate = sh.rate.load(Ordering::Relaxed);
-            if rate != codec_rate {
-                codec_rate = rate;
-                resampler = Resampler::new(device_rate, codec_rate);
+            // The sound must not wait for the user interface; if it holds the settings right
+            // now, the last choice stays for this round.
+            if let Ok(settings) = settings.try_lock() {
+                suppress_noise = settings.noise_suppression;
             }
             let mut cap = sh.capture.lock().unwrap();
             for frame in data.chunks(channels) {
-                resampler.push(f32::from_sample(frame[0]), |v| cap.push_back((v.clamp(-1.0, 1.0) * 32767.0) as i16));
+                capture.feed(f32::from_sample(frame[0]), rate, suppress_noise, &mut cap);
             }
         },
         |e| eprintln!("Mikrofon: {e}"),
@@ -621,6 +699,27 @@ mod tests {
         // ... and what it cannot carry is removed, not folded back as a lower tone.
         let (tone, rest) = convert_tone(6000.0, 48000, 8000, true);
         assert!(tone.max(rest) / level < 0.005, "6 kHz at 8 kHz: {tone} / {rest}");
+    }
+
+    #[test]
+    fn noise_suppression_quiets_noise() {
+        // Four seconds of quiet hiss from a 44.1 kHz microphone, for a call with Opus. The
+        // suppression needs a moment to tell that this is no speech.
+        let run = |suppress: bool| -> (usize, f64) {
+            let mut capture = Capture::new(44100, 16000);
+            let mut out = VecDeque::new();
+            let mut seed = 12345u32;
+            for _ in 0..176400 {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                capture.feed((seed >> 8) as f32 / (1 << 23) as f32 * 0.02 - 0.02, 16000, suppress, &mut out);
+            }
+            let late: Vec<i16> = out.iter().skip(out.len() * 3 / 4).copied().collect();
+            (out.len(), rms(&late))
+        };
+        let ((plain_len, plain), (clean_len, clean)) = (run(false), run(true));
+        assert!(plain_len.abs_diff(64000) <= 2 && clean_len.abs_diff(64000) <= 480, "{plain_len} / {clean_len} samples");
+        assert!(plain > 100.0, "the hiss is there without suppression: {plain}");
+        assert!(clean < plain / 2.0, "hiss of {plain} is left at {clean}");
     }
 
     #[test]

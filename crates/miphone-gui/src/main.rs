@@ -818,6 +818,7 @@ impl App {
             let mut devices = self.audio.lock().unwrap();
             devices.input = settings.audio_input;
             devices.output = settings.audio_output;
+            devices.noise_suppression = settings.noise_suppression.unwrap_or(true);
         }
         self.login.server = settings.server;
         self.login.user = settings.user;
@@ -899,6 +900,7 @@ impl App {
             ring_outputs: self.ring_outputs.clone(),
             ringtone: self.ring_tone.to_setting(),
             ring_volume: Some(self.ring_volume),
+            noise_suppression: Some(devices.noise_suppression),
         };
         if let Err(e) = store.save_settings(&settings) {
             self.status_line = format!("Speichern fehlgeschlagen: {e:#}");
@@ -2151,6 +2153,13 @@ impl App {
             (self.inputs, self.outputs) = media::list_devices();
         }
         ui.label(egui::RichText::new("Die Auswahl gilt ab dem nächsten Gespräch.").weak().small());
+        ui.add_space(6.0);
+        let mut noise_suppression = before.noise_suppression;
+        if ui.checkbox(&mut noise_suppression, "Rauschunterdrückung für das Mikrofon").changed() {
+            self.audio.lock().unwrap().noise_suppression = noise_suppression;
+            self.persist();
+        }
+        ui.label(egui::RichText::new("Nimmt Hintergrundgeräusche heraus. Wirkt sofort, auch im Gespräch.").weak().small());
         ui.add_space(16.0);
         self.ringtone_settings(ui);
     }

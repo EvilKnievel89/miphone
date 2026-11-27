@@ -49,6 +49,8 @@ pub struct Settings {
     pub ringtone: String,
     /// Volume of the ringtone in percent; `None` is the program's default.
     pub ring_volume: Option<u8>,
+    /// Noise suppression for the microphone; `None` is the program's default (on).
+    pub noise_suppression: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,6 +322,7 @@ mod tests {
             ring_outputs: vec!["Headset Lautsprecher".into(), "Monitor".into()],
             ringtone: "builtin:1".into(),
             ring_volume: Some(40),
+            noise_suppression: Some(false),
         };
         store.save_settings(&settings).unwrap();
         let raw = std::fs::read(dir.path().join("settings.dat")).unwrap();
