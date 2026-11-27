@@ -151,6 +151,8 @@ pub enum Signal {
     Ringback,
     /// The other end is busy: tone and silence of 480 ms each.
     Busy,
+    /// The call is connected: one short, low tone.
+    Connected,
     /// The call is over: two short tones, the second one lower, as mobile phones make them.
     Ended,
 }
@@ -166,6 +168,7 @@ impl Signal {
         match self {
             Signal::Ringback => &[(425.0, 1000), (0.0, 4000)],
             Signal::Busy => &[(425.0, 480), (0.0, 480)],
+            Signal::Connected => &[(360.0, 50), (0.0, 400)],
             Signal::Ended => &[(480.0, 140), (0.0, 60), (360.0, 200), (0.0, 400)],
         }
     }
@@ -174,6 +177,7 @@ impl Signal {
     pub fn once(self) -> Option<Duration> {
         match self {
             // Up to the silence at the end, which leaves room to stop in time.
+            Signal::Connected => Some(Duration::from_millis(200)),
             Signal::Ended => Some(Duration::from_millis(500)),
             Signal::Ringback | Signal::Busy => None,
         }
@@ -425,6 +429,11 @@ mod tests {
         // It stops in the silence at its end, before it would start over.
         let once = Signal::Ended.once().unwrap().as_millis();
         assert!((400..800 - 100).contains(&once) && Signal::Busy.once().is_none());
+
+        let sound = Signal::Connected.sound();
+        let loud = |from: usize, to: usize| sound.samples[from * 8..to * 8].iter().any(|s| s.abs() > 0.1);
+        assert!(sound.frames() == 3600 && loud(0, 50) && !loud(50, 450));
+        assert!((50..450 - 100).contains(&Signal::Connected.once().unwrap().as_millis()));
     }
 
     /// Plays the tones for a moment; heard, so it runs only when asked for:
@@ -439,6 +448,9 @@ mod tests {
         let busy = Ringer::signal(Signal::Busy, None, Some(Duration::from_millis(1500)));
         std::thread::sleep(Duration::from_millis(2000));
         assert_eq!(busy.take_error(), None);
+        let connected = Ringer::signal(Signal::Connected, None, None);
+        std::thread::sleep(Duration::from_millis(1000));
+        assert_eq!(connected.take_error(), None);
         let ended = Ringer::signal(Signal::Ended, None, None);
         std::thread::sleep(Duration::from_millis(1500));
         assert_eq!(ended.take_error(), None);

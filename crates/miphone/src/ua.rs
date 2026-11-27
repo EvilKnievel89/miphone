@@ -223,6 +223,8 @@ struct Ua<'a, S> {
     /// The tone after a call: busy, or the one that tells that the call is over. It ends
     /// by itself.
     after_call: Option<Ringer>,
+    /// The short tone at the moment a call is connected.
+    connected_tone: Option<Ringer>,
     /// There was a call in progress when the tones were last looked at.
     was_connected: bool,
 }
@@ -352,6 +354,7 @@ where
         call: None,
         ringback: None,
         after_call: None,
+        connected_tone: None,
         was_connected: false,
     };
     say!(ua, "Verbunden mit {} (lokal {})", cfg.host_port(), local);
@@ -429,6 +432,10 @@ impl<S: AsyncRead + AsyncWrite> Ua<'_, S> {
             self.after_call = None;
         } else if self.was_connected {
             self.after_call = self.tone_output().map(|output| Ringer::signal(Signal::Ended, output, None));
+        }
+        // A call was answered, here or at the other end: a short tone says so.
+        if connected && !self.was_connected {
+            self.connected_tone = self.tone_output().map(|output| Ringer::signal(Signal::Connected, output, None));
         }
         self.was_connected = connected;
     }
