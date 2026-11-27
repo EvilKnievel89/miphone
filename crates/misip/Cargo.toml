@@ -1,6 +1,6 @@
 [package]
 name = "misip"
-version = "0.2.1-pre.2"
+version = "0.2.2-pre.1"
 edition = "2024"
 license = "MIT"
 
