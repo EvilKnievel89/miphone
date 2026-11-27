@@ -19,6 +19,7 @@ use tokio::time::{sleep_until, timeout, Duration, Instant};
 
 use crate::config::SipConfig;
 use crate::media::{AudioCodec, AudioSettings, Media, MediaConfig, OPUS_FMTP};
+use crate::ringtone::{Ringer, Signal};
 
 /// Reports a line of text to the user (console or user interface).
 macro_rules! say {
@@ -61,6 +62,9 @@ pub enum CallPhase {
     /// Held by us.
     Held,
 }
+
+/// How long the busy tone sounds after a call to a busy number.
+const BUSY_TONE: Duration = Duration::from_secs(4);
 
 const ALLOW: &str = "INVITE, ACK, CANCEL, OPTIONS, BYE, NOTIFY, INFO, UPDATE, PRACK";
 
@@ -214,6 +218,10 @@ struct Ua<'a, S> {
     /// Set when the server withdrew the hotdesk login; the softphone then signs off.
     evicted: bool,
     call: Option<Call>,
+    /// The tone while our call rings at the other end.
+    ringback: Option<Ringer>,
+    /// The tone after a call to a busy number; it ends by itself.
+    busy: Option<Ringer>,
 }
 
 /// Runs one connection until the user quits (`Ok`) or the connection fails (`Err`).
@@ -339,6 +347,8 @@ where
         hotdesk_refused: false,
         evicted: false,
         call: None,
+        ringback: None,
+        busy: None,
     };
     say!(ua, "Verbunden mit {} (lokal {})", cfg.host_port(), local);
 
@@ -394,8 +404,29 @@ impl<S: AsyncRead + AsyncWrite> Ua<'_, S> {
         Snapshot { registered: self.registered, call }
     }
 
+    /// The output device for calls, if sound is in use at all (not in tests).
+    fn tone_output(&self) -> Option<Option<String>> {
+        self.audio.as_ref().map(|audio| audio.lock().unwrap().output.clone())
+    }
+
+    /// Starts and stops the tone heard while our call rings at the other end. The telephone
+    /// system only says that it rings (180); the tone is ours to make, unless the other end
+    /// sends sound of its own before the call is answered (early media).
+    fn update_tones(&mut self) {
+        let rings = self.call.as_ref().is_some_and(|c| !c.incoming && c.state == CallState::Ringing && c.ringing_reported && c.remote_sdp.is_none());
+        match (rings, self.ringback.is_some()) {
+            (true, false) => self.ringback = self.tone_output().map(|output| Ringer::signal(Signal::Ringback, output, None)),
+            (false, true) => self.ringback = None,
+            _ => {}
+        }
+        if self.call.is_some() {
+            self.busy = None;
+        }
+    }
+
     /// Tells the front end about a changed state.
     fn publish(&mut self) {
+        self.update_tones();
         let now = self.snapshot();
         if now != self.published {
             self.published = now.clone();
@@ -681,6 +712,9 @@ impl<S: AsyncRead + AsyncWrite> Ua<'_, S> {
                 say!(self, "Anruf abgebrochen.");
             } else {
                 say!(self, "Anruf fehlgeschlagen: {code} {}", reason(rsp));
+                if matches!(code, 486 | 600) {
+                    self.busy = self.tone_output().map(|output| Ringer::signal(Signal::Busy, output, Some(BUSY_TONE)));
+                }
             }
             return Ok(()); // call (and its media) is dropped
         }

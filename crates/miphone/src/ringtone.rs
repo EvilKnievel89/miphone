@@ -1,11 +1,14 @@
 //! Ringtones: the tones built into the program or a sound file of the user, played in a
 //! loop on one or several output devices until the call is answered or gone.
+//!
+//! Also the tones a telephone line makes while our call rings at the other end or the other
+//! end is busy. The telephone system only reports these states; the tone is made here.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -140,6 +143,44 @@ fn decode(source: Box<dyn MediaSource>, extension: Option<&str>) -> Result<Sound
     Ok(sound)
 }
 
+/// A tone of the telephone line, as it sounds in Germany: 425 Hz in a rhythm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    /// The call rings at the other end: one second of tone, four of silence.
+    Ringback,
+    /// The other end is busy: tone and silence of 480 ms each.
+    Busy,
+}
+
+impl Signal {
+    const RATE: u32 = 8000;
+    const FREQUENCY: f32 = 425.0;
+    /// Loud enough to hear, quieter than speech.
+    const LEVEL: f32 = 0.18;
+
+    /// Tone and silence in milliseconds.
+    fn rhythm(self) -> (usize, usize) {
+        match self {
+            Signal::Ringback => (1000, 4000),
+            Signal::Busy => (480, 480),
+        }
+    }
+
+    /// One round of the rhythm, to be played in a loop.
+    fn sound(self) -> Sound {
+        let (on, off) = self.rhythm();
+        let frames = |ms: usize| ms * Self::RATE as usize / 1000;
+        let (tone, fade) = (frames(on), frames(8));
+        let mut samples = vec![0.0; tone + frames(off)];
+        for (i, sample) in samples[..tone].iter_mut().enumerate() {
+            // Fading in and out keeps the tone from starting and ending with a click.
+            let edge = (i.min(tone - 1 - i) as f32 / fade as f32).min(1.0);
+            *sample = (std::f32::consts::TAU * Self::FREQUENCY * i as f32 / Self::RATE as f32).sin() * Self::LEVEL * edge;
+        }
+        Sound { rate: Self::RATE, channels: 1, samples }
+    }
+}
+
 /// The gain for a volume between 0 and 1. Squared, because loudness is not heard linearly
 /// and the lower half of a linear slider would do almost nothing.
 fn gain(volume: f32) -> f32 {
@@ -168,6 +209,15 @@ impl Ringer {
         let thread_shared = shared.clone();
         // Decoding takes a moment and the streams must stay on the thread that opened them.
         std::thread::spawn(move || ring_thread(thread_shared, tone, outputs));
+        Ringer { shared }
+    }
+
+    /// Plays a tone of the telephone line on the output device of this name, or on the
+    /// system's default device, until this value is dropped or `limit` is over.
+    pub fn signal(signal: Signal, output: Option<String>, limit: Option<Duration>) -> Ringer {
+        let shared = Arc::new(Shared { stop: AtomicBool::new(false), gain: AtomicU32::new(1f32.to_bits()), error: Mutex::new(None) });
+        let thread_shared = shared.clone();
+        std::thread::spawn(move || play(thread_shared, signal.sound(), output.into_iter().collect(), "Signalton", limit));
         Ringer { shared }
     }
 
@@ -201,6 +251,13 @@ fn ring_thread(shared: Arc<Shared>, tone: Tone, outputs: Vec<String>) {
         }
         Err(e) => return report(format!("Klingelton: {e:#}")),
     };
+    play(shared, sound, outputs, "Klingelton", None);
+}
+
+/// Plays the sound in a loop on the devices of these names until told to stop or until
+/// `limit` is over. `what` names the sound in messages to the user.
+fn play(shared: Arc<Shared>, sound: Sound, outputs: Vec<String>, what: &str, limit: Option<Duration>) {
+    let report = |message: String| *shared.error.lock().unwrap() = Some(message);
     let sound = Arc::new(sound);
 
     let host = cpal::default_host();
@@ -215,16 +272,17 @@ fn ring_thread(shared: Arc<Shared>, tone: Tone, outputs: Vec<String>) {
     for device in &devices {
         match open_stream(device, sound.clone(), shared.clone()) {
             Ok(stream) => streams.push(stream),
-            Err(e) => report(format!("Klingelton auf {}: {e:#}", device_name(device).unwrap_or_else(|| "Ausgabegerät".into()))),
+            Err(e) => report(format!("{what} auf {}: {e:#}", device_name(device).unwrap_or_else(|| "Ausgabegerät".into()))),
         }
     }
     if streams.is_empty() {
         if devices.is_empty() {
-            report("Klingelton: kein Ausgabegerät gefunden".into());
+            report(format!("{what}: kein Ausgabegerät gefunden"));
         }
         return;
     }
-    while !shared.stop.load(Ordering::Relaxed) {
+    let end = limit.map(|limit| Instant::now() + limit);
+    while !shared.stop.load(Ordering::Relaxed) && end.is_none_or(|end| Instant::now() < end) {
         std::thread::sleep(Duration::from_millis(30));
     }
     drop(streams);
@@ -322,6 +380,37 @@ mod tests {
                 assert_eq!(error.is_some(), missing_file, "{error:?}");
             }
         }
+    }
+
+    #[test]
+    fn makes_the_tones_of_the_line() {
+        for (signal, tone, round) in [(Signal::Ringback, 8000, 40000), (Signal::Busy, 3840, 7680)] {
+            let sound = signal.sound();
+            assert_eq!((sound.rate, sound.channels, sound.frames()), (8000, 1, round));
+            assert!(sound.samples[tone..].iter().all(|s| *s == 0.0), "{signal:?}: silence after the tone");
+            assert_eq!(sound.samples[0], 0.0, "{signal:?}: starts softly");
+            assert!(sound.samples[tone - 1].abs() < 0.01, "{signal:?}: ends softly");
+            let peak = sound.samples.iter().fold(0f32, |peak, s| peak.max(s.abs()));
+            assert!((0.17..=0.18).contains(&peak), "{signal:?}: peak {peak}");
+            // 425 Hz: the tone crosses zero 850 times a second.
+            let crossings = sound.samples[..tone].windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count();
+            let expected = 850 * tone / 8000;
+            assert!(crossings.abs_diff(expected) <= 2, "{signal:?}: {crossings} crossings, expected {expected}");
+        }
+    }
+
+    /// Plays both tones for a moment; heard, so it runs only when asked for:
+    /// `cargo test -p miphone signals_on_real_device -- --ignored`.
+    #[test]
+    #[ignore]
+    fn signals_on_real_device() {
+        let ringback = Ringer::signal(Signal::Ringback, None, None);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(ringback.take_error(), None);
+        drop(ringback);
+        let busy = Ringer::signal(Signal::Busy, None, Some(Duration::from_millis(1500)));
+        std::thread::sleep(Duration::from_millis(2000));
+        assert_eq!(busy.take_error(), None);
     }
 
     #[test]

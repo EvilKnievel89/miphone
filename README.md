@@ -27,6 +27,8 @@ Windows only. The user interface is in German.
 - **Phone book**: the corporate directory and the user's contact groups, with search.
 - **Ringtone**: two built-in tones or a sound file of your own, on one or several output
   devices, with its own volume.
+- **Ringback and busy tone** on outgoing calls, made by the program (425 Hz in the German
+  rhythm) unless the other end sends sound of its own.
 - **Own contacts**: contacts the user creates, stored encrypted on the computer only.
 - **Call history**, kept locally.
 - **Local data is encrypted** with the Windows account (DPAPI) under `%APPDATA%\miphone`.
