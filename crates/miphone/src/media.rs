@@ -388,30 +388,137 @@ fn open_input(host: &cpal::Host, sh: Arc<Shared>, name: Option<&str>) -> anyhow:
     Ok(stream)
 }
 
-/// Playback: samples at the codec rate are stretched to the device rate by linear interpolation.
+/// Zero crossings of the resampling filter on each side of its centre.
+const FILTER_ZEROS: usize = 16;
+/// Entries of the filter table between two zero crossings.
+const FILTER_STEPS: usize = 64;
+/// The filter cuts off a little below half the lower sample rate, to have room to fall off.
+const FILTER_CUTOFF: f32 = 0.95;
+/// After the sound ran out, this much is collected before it plays again, so that packets
+/// arriving a little unevenly do not tear a hole into it each time.
+const PLAYBACK_CUSHION_MS: usize = 40;
+
+/// The filter: a sinc under a Blackman window, from its centre to its last zero crossing.
+fn filter_table() -> &'static [f32] {
+    static TABLE: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let len = FILTER_ZEROS * FILTER_STEPS;
+        (0..=len + 1)
+            .map(|i| {
+                let u = i as f32 / FILTER_STEPS as f32;
+                let x = (i as f32 / len as f32).min(1.0) * std::f32::consts::PI;
+                let window = 0.42 + 0.5 * x.cos() + 0.08 * (2.0 * x).cos();
+                let sinc = if i == 0 { 1.0 } else { (std::f32::consts::PI * u).sin() / (std::f32::consts::PI * u) };
+                sinc * window
+            })
+            .collect()
+    })
+}
+
+/// Converts sound from one sample rate to another with a low-pass filter. Without the
+/// filter, sound stretched to a higher rate gets mirror images of itself above the old
+/// range (it sounds tinny), and sound squeezed to a lower rate gets what no longer fits
+/// folded back into it.
+struct Resampler {
+    from: u32,
+    /// Input samples per output sample.
+    step: f64,
+    /// Zero crossings of the filter per input sample.
+    scale: f32,
+    half: usize,
+    /// The last `2 * half` input samples.
+    window: VecDeque<f32>,
+    /// Where the next output sample lies, in input samples after `window[half - 1]`.
+    phase: f64,
+}
+
+impl Resampler {
+    fn new(from: u32, to: u32) -> Resampler {
+        let scale = (to as f32 / from as f32).min(1.0) * FILTER_CUTOFF;
+        let half = (FILTER_ZEROS as f32 / scale).ceil() as usize;
+        Resampler { from, step: from as f64 / to as f64, scale, half, window: VecDeque::from(vec![0.0; 2 * half]), phase: 1.0 }
+    }
+
+    fn shift(&mut self, sample: f32) {
+        self.window.pop_front();
+        self.window.push_back(sample);
+        self.phase -= 1.0;
+    }
+
+    fn value(&self) -> f32 {
+        let table = filter_table();
+        let centre = (self.half - 1) as f32 + self.phase as f32;
+        let (mut sum, mut weights) = (0.0f32, 0.0f32);
+        for (i, sample) in self.window.iter().enumerate() {
+            let at = (i as f32 - centre).abs() * self.scale * FILTER_STEPS as f32;
+            let index = at as usize;
+            if index < table.len() - 1 {
+                let weight = table[index] + (table[index + 1] - table[index]) * (at - index as f32);
+                sum += sample * weight;
+                weights += weight;
+            }
+        }
+        // Dividing by the weights keeps the loudness the same wherever the sample lies.
+        if weights.abs() > 1e-6 { sum / weights } else { 0.0 }
+    }
+
+    /// The next output sample; `input` is asked for as many input samples as it takes.
+    fn pull(&mut self, mut input: impl FnMut() -> f32) -> f32 {
+        while self.phase >= 1.0 {
+            self.shift(input());
+        }
+        let value = self.value();
+        self.phase += self.step;
+        value
+    }
+
+    /// Takes one input sample and hands out the output samples that are due with it.
+    fn push(&mut self, sample: f32, mut output: impl FnMut(f32)) {
+        self.shift(sample);
+        while self.phase < 1.0 {
+            output(self.value());
+            self.phase += self.step;
+        }
+    }
+}
+
+/// Playback: samples at the codec rate are converted to the rate of the device.
 fn build_output<T>(device: &cpal::Device, config: &cpal::StreamConfig, sh: Arc<Shared>) -> anyhow::Result<cpal::Stream>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {
     let channels = config.channels as usize;
-    let device_rate = sample_rate_hz(config) as f32;
-    let mut phase = 1.0f32;
-    let (mut prev, mut cur) = (0.0f32, 0.0f32);
+    let device_rate = sample_rate_hz(config);
+    let mut resampler = Resampler::new(sh.rate.load(Ordering::Relaxed), device_rate);
+    // Nothing plays until the cushion is there.
+    let mut filling = true;
     let stream = device.build_output_stream(
         *config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            let step = sh.rate.load(Ordering::Relaxed) as f32 / device_rate;
+            let rate = sh.rate.load(Ordering::Relaxed);
+            if resampler.from != rate {
+                resampler = Resampler::new(rate, device_rate);
+                filling = true;
+            }
             let mut play = sh.playback.lock().unwrap();
+            if filling && play.len() >= rate as usize * PLAYBACK_CUSHION_MS / 1000 {
+                filling = false;
+            }
             for frame in data.chunks_mut(channels) {
-                while phase >= 1.0 {
-                    phase -= 1.0;
-                    prev = cur;
-                    cur = play.pop_front().map(|s| s as f32 / 32768.0).unwrap_or(0.0);
-                }
-                let v = prev + (cur - prev) * phase;
-                phase += step;
+                let v = resampler.pull(|| {
+                    if filling {
+                        return 0.0;
+                    }
+                    match play.pop_front() {
+                        Some(s) => s as f32 / 32768.0,
+                        None => {
+                            filling = true;
+                            0.0
+                        }
+                    }
+                });
                 for out in frame.iter_mut() {
-                    *out = T::from_sample(v);
+                    *out = T::from_sample(v.clamp(-1.0, 1.0));
                 }
             }
         },
@@ -421,7 +528,7 @@ where
     Ok(stream)
 }
 
-/// Capture: the first channel is averaged down to the codec rate.
+/// Capture: the first channel is converted to the codec rate.
 fn build_input<T>(device: &cpal::Device, config: &cpal::StreamConfig, sh: Arc<Shared>) -> anyhow::Result<cpal::Stream>
 where
     T: cpal::SizedSample,
@@ -429,25 +536,20 @@ where
 {
     use cpal::Sample;
     let channels = config.channels as usize;
-    let device_rate = sample_rate_hz(config) as f32;
-    let mut phase = 0.0f32;
-    let (mut acc, mut count) = (0.0f32, 0u32);
+    let device_rate = sample_rate_hz(config);
+    let mut codec_rate = sh.rate.load(Ordering::Relaxed);
+    let mut resampler = Resampler::new(device_rate, codec_rate);
     let stream = device.build_input_stream(
         *config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
-            let step = sh.rate.load(Ordering::Relaxed) as f32 / device_rate;
+            let rate = sh.rate.load(Ordering::Relaxed);
+            if rate != codec_rate {
+                codec_rate = rate;
+                resampler = Resampler::new(device_rate, codec_rate);
+            }
             let mut cap = sh.capture.lock().unwrap();
             for frame in data.chunks(channels) {
-                acc += f32::from_sample(frame[0]);
-                count += 1;
-                phase += step;
-                if phase >= 1.0 {
-                    phase -= 1.0;
-                    let v = (acc / count as f32).clamp(-1.0, 1.0);
-                    cap.push_back((v * 32767.0) as i16);
-                    acc = 0.0;
-                    count = 0;
-                }
+                resampler.push(f32::from_sample(frame[0]), |v| cap.push_back((v.clamp(-1.0, 1.0) * 32767.0) as i16));
             }
         },
         |e| eprintln!("Mikrofon: {e}"),
@@ -477,6 +579,69 @@ mod tests {
     }
 
     /// Two sessions on the loopback interface exchange audio and DTMF.
+    /// A tone of `hz` at the rate `from`, converted to the rate `to`: how loud the tone
+    /// still is, and how loud everything else is that the conversion added (both as RMS).
+    fn convert_tone(hz: f64, from: u32, to: u32, push: bool) -> (f64, f64) {
+        let mut resampler = Resampler::new(from, to);
+        let mut n = 0u64;
+        let mut next = || {
+            n += 1;
+            (std::f64::consts::TAU * hz * n as f64 / from as f64).sin() as f32 * 0.5
+        };
+        let mut out = Vec::new();
+        if push {
+            for _ in 0..from {
+                resampler.push(next(), |v| out.push(v as f64));
+            }
+        } else {
+            out.extend((0..to).map(|_| resampler.pull(&mut next) as f64));
+        }
+        let out = &out[out.len() / 4..]; // without the start, where the filter is still empty
+        let part = |f: fn(f64) -> f64| out.iter().enumerate().map(|(i, v)| v * f(std::f64::consts::TAU * hz * i as f64 / to as f64)).sum::<f64>() * 2.0 / out.len() as f64;
+        let tone = (part(f64::sin).powi(2) + part(f64::cos).powi(2)) / 2.0;
+        let total = out.iter().map(|v| v * v).sum::<f64>() / out.len() as f64;
+        (tone.sqrt(), (total - tone).max(0.0).sqrt())
+    }
+
+    #[test]
+    fn resampling_keeps_the_sound_and_adds_nothing() {
+        let level = 0.5 / 2f64.sqrt();
+        // Playback of telephone sound (8 kHz) and of Opus (16 kHz) on common devices.
+        for (hz, from, to) in [(1000.0, 8000, 48000), (3000.0, 8000, 48000), (3000.0, 8000, 44100), (6000.0, 16000, 48000), (1000.0, 48000, 48000)] {
+            let (tone, rest) = convert_tone(hz, from, to, false);
+            assert!((tone / level - 1.0).abs() < 0.03, "{hz} Hz {from}->{to}: level {tone}");
+            assert!(rest / level < 0.005, "{hz} Hz {from}->{to}: {rest} of other sound");
+        }
+        // The microphone: what the codec can carry passes ...
+        for (hz, from, to) in [(1000.0, 48000, 8000), (3000.0, 44100, 8000), (6000.0, 48000, 16000)] {
+            let (tone, rest) = convert_tone(hz, from, to, true);
+            assert!((tone / level - 1.0).abs() < 0.03, "{hz} Hz {from}->{to}: level {tone}");
+            assert!(rest / level < 0.005, "{hz} Hz {from}->{to}: {rest} of other sound");
+        }
+        // ... and what it cannot carry is removed, not folded back as a lower tone.
+        let (tone, rest) = convert_tone(6000.0, 48000, 8000, true);
+        assert!(tone.max(rest) / level < 0.005, "6 kHz at 8 kHz: {tone} / {rest}");
+    }
+
+    #[test]
+    fn resampling_keeps_the_pace() {
+        let mut resampler = Resampler::new(8000, 44100);
+        let mut asked = 0;
+        for _ in 0..44100 {
+            resampler.pull(|| {
+                asked += 1;
+                0.0
+            });
+        }
+        assert!((7999..=8001).contains(&asked), "{asked} samples asked for in a second");
+        let mut resampler = Resampler::new(44100, 16000);
+        let mut made = 0;
+        for _ in 0..44100 {
+            resampler.push(0.0, |_| made += 1);
+        }
+        assert!((15999..=16001).contains(&made), "{made} samples made in a second");
+    }
+
     #[test]
     fn rtp_flows_between_two_sessions() {
         const FRAME: usize = 160;
