@@ -143,39 +143,54 @@ fn decode(source: Box<dyn MediaSource>, extension: Option<&str>) -> Result<Sound
     Ok(sound)
 }
 
-/// A tone of the telephone line, as it sounds in Germany: 425 Hz in a rhythm.
+/// A tone the telephone makes by itself. Those of the line sound as in Germany: 425 Hz in
+/// a rhythm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     /// The call rings at the other end: one second of tone, four of silence.
     Ringback,
     /// The other end is busy: tone and silence of 480 ms each.
     Busy,
+    /// The call is over: two short tones, the second one lower, as mobile phones make them.
+    Ended,
 }
 
 impl Signal {
     const RATE: u32 = 8000;
-    const FREQUENCY: f32 = 425.0;
     /// Loud enough to hear, quieter than speech.
     const LEVEL: f32 = 0.18;
 
-    /// Tone and silence in milliseconds.
-    fn rhythm(self) -> (usize, usize) {
+    /// The tones in their order, each with its pitch in Hz (0 is silence) and its length
+    /// in milliseconds.
+    fn pattern(self) -> &'static [(f32, usize)] {
         match self {
-            Signal::Ringback => (1000, 4000),
-            Signal::Busy => (480, 480),
+            Signal::Ringback => &[(425.0, 1000), (0.0, 4000)],
+            Signal::Busy => &[(425.0, 480), (0.0, 480)],
+            Signal::Ended => &[(480.0, 140), (0.0, 60), (360.0, 200), (0.0, 400)],
         }
     }
 
-    /// One round of the rhythm, to be played in a loop.
+    /// How long a tone that is heard only once plays; the others go on until stopped.
+    pub fn once(self) -> Option<Duration> {
+        match self {
+            // Up to the silence at the end, which leaves room to stop in time.
+            Signal::Ended => Some(Duration::from_millis(500)),
+            Signal::Ringback | Signal::Busy => None,
+        }
+    }
+
+    /// One round of the pattern, to be played in a loop.
     fn sound(self) -> Sound {
-        let (on, off) = self.rhythm();
         let frames = |ms: usize| ms * Self::RATE as usize / 1000;
-        let (tone, fade) = (frames(on), frames(8));
-        let mut samples = vec![0.0; tone + frames(off)];
-        for (i, sample) in samples[..tone].iter_mut().enumerate() {
-            // Fading in and out keeps the tone from starting and ending with a click.
-            let edge = (i.min(tone - 1 - i) as f32 / fade as f32).min(1.0);
-            *sample = (std::f32::consts::TAU * Self::FREQUENCY * i as f32 / Self::RATE as f32).sin() * Self::LEVEL * edge;
+        let fade = frames(8);
+        let mut samples = Vec::new();
+        for &(pitch, ms) in self.pattern() {
+            let len = frames(ms);
+            samples.extend((0..len).map(|i| {
+                // Fading in and out keeps the tone from starting and ending with a click.
+                let edge = (i.min(len - 1 - i) as f32 / fade as f32).min(1.0);
+                (std::f32::consts::TAU * pitch * i as f32 / Self::RATE as f32).sin() * Self::LEVEL * edge
+            }));
         }
         Sound { rate: Self::RATE, channels: 1, samples }
     }
@@ -212,9 +227,11 @@ impl Ringer {
         Ringer { shared }
     }
 
-    /// Plays a tone of the telephone line on the output device of this name, or on the
-    /// system's default device, until this value is dropped or `limit` is over.
+    /// Plays a tone of the telephone on the output device of this name, or on the system's
+    /// default device, until this value is dropped or `limit` is over. A tone that is heard
+    /// only once ends by itself.
     pub fn signal(signal: Signal, output: Option<String>, limit: Option<Duration>) -> Ringer {
+        let limit = signal.once().or(limit);
         let shared = Arc::new(Shared { stop: AtomicBool::new(false), gain: AtomicU32::new(1f32.to_bits()), error: Mutex::new(None) });
         let thread_shared = shared.clone();
         std::thread::spawn(move || play(thread_shared, signal.sound(), output.into_iter().collect(), "Signalton", limit));
@@ -399,7 +416,18 @@ mod tests {
         }
     }
 
-    /// Plays both tones for a moment; heard, so it runs only when asked for:
+    #[test]
+    fn makes_the_tone_for_the_end_of_a_call() {
+        let sound = Signal::Ended.sound();
+        assert_eq!(sound.frames(), 6400);
+        let loud = |from: usize, to: usize| sound.samples[from * 8..to * 8].iter().any(|s| s.abs() > 0.1);
+        assert!(loud(0, 140) && !loud(140, 200) && loud(200, 400) && !loud(400, 800));
+        // It stops in the silence at its end, before it would start over.
+        let once = Signal::Ended.once().unwrap().as_millis();
+        assert!((400..800 - 100).contains(&once) && Signal::Busy.once().is_none());
+    }
+
+    /// Plays the tones for a moment; heard, so it runs only when asked for:
     /// `cargo test -p miphone signals_on_real_device -- --ignored`.
     #[test]
     #[ignore]
@@ -411,6 +439,9 @@ mod tests {
         let busy = Ringer::signal(Signal::Busy, None, Some(Duration::from_millis(1500)));
         std::thread::sleep(Duration::from_millis(2000));
         assert_eq!(busy.take_error(), None);
+        let ended = Ringer::signal(Signal::Ended, None, None);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(ended.take_error(), None);
     }
 
     #[test]

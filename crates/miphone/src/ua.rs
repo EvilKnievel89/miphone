@@ -220,8 +220,11 @@ struct Ua<'a, S> {
     call: Option<Call>,
     /// The tone while our call rings at the other end.
     ringback: Option<Ringer>,
-    /// The tone after a call to a busy number; it ends by itself.
-    busy: Option<Ringer>,
+    /// The tone after a call: busy, or the one that tells that the call is over. It ends
+    /// by itself.
+    after_call: Option<Ringer>,
+    /// There was a call in progress when the tones were last looked at.
+    was_connected: bool,
 }
 
 /// Runs one connection until the user quits (`Ok`) or the connection fails (`Err`).
@@ -348,7 +351,8 @@ where
         evicted: false,
         call: None,
         ringback: None,
-        busy: None,
+        after_call: None,
+        was_connected: false,
     };
     say!(ua, "Verbunden mit {} (lokal {})", cfg.host_port(), local);
 
@@ -409,9 +413,9 @@ impl<S: AsyncRead + AsyncWrite> Ua<'_, S> {
         self.audio.as_ref().map(|audio| audio.lock().unwrap().output.clone())
     }
 
-    /// Starts and stops the tone heard while our call rings at the other end. The telephone
-    /// system only says that it rings (180); the tone is ours to make, unless the other end
-    /// sends sound of its own before the call is answered (early media).
+    /// Starts and stops the tones around a call. While our call rings at the other end, the
+    /// telephone system only says that it rings (180); the tone is ours to make, unless the
+    /// other end sends sound of its own before the call is answered (early media).
     fn update_tones(&mut self) {
         let rings = self.call.as_ref().is_some_and(|c| !c.incoming && c.state == CallState::Ringing && c.ringing_reported && c.remote_sdp.is_none());
         match (rings, self.ringback.is_some()) {
@@ -419,9 +423,14 @@ impl<S: AsyncRead + AsyncWrite> Ua<'_, S> {
             (false, true) => self.ringback = None,
             _ => {}
         }
+        // A call that was in progress is over, whoever ended it: a short tone says so.
+        let connected = self.call.as_ref().is_some_and(|c| c.state == CallState::Established);
         if self.call.is_some() {
-            self.busy = None;
+            self.after_call = None;
+        } else if self.was_connected {
+            self.after_call = self.tone_output().map(|output| Ringer::signal(Signal::Ended, output, None));
         }
+        self.was_connected = connected;
     }
 
     /// Tells the front end about a changed state.
@@ -713,7 +722,7 @@ impl<S: AsyncRead + AsyncWrite> Ua<'_, S> {
             } else {
                 say!(self, "Anruf fehlgeschlagen: {code} {}", reason(rsp));
                 if matches!(code, 486 | 600) {
-                    self.busy = self.tone_output().map(|output| Ringer::signal(Signal::Busy, output, Some(BUSY_TONE)));
+                    self.after_call = self.tone_output().map(|output| Ringer::signal(Signal::Busy, output, Some(BUSY_TONE)));
                 }
             }
             return Ok(()); // call (and its media) is dropped

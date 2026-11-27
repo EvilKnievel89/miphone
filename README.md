@@ -30,6 +30,7 @@ Windows only. The user interface is in German.
 - **Noise suppression** for the microphone (RNNoise), to be switched off in the settings.
 - **Ringback and busy tone** on outgoing calls, made by the program (425 Hz in the German
   rhythm) unless the other end sends sound of its own.
+- **A short tone when a call ends**, as on mobile phones.
 - **Own contacts**: contacts the user creates, stored encrypted on the computer only.
 - **Call history**, kept locally.
 - **Local data is encrypted** with the Windows account (DPAPI) under `%APPDATA%\miphone`.
