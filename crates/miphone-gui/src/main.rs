@@ -25,10 +25,12 @@ use miphone::provision;
 use miphone::ringtone::{self, Ringer, Tone};
 use miphone::store::{CallRecord, DirectoryCache, Settings, Store};
 use miphone::ua::{self, CallPhase, CallSnapshot, Command, Event, Snapshot};
+use miphone::update::{self, Release};
 use miphone::wsp::{self, Indicator, Presence, ServerEvent, Watchlist};
 use tokio::sync::mpsc;
 
 fn main() -> eframe::Result {
+    update::clean_up();
     // The profile is part of the title, to tell the windows of several profiles apart.
     let title = match profile_argument() {
         Some(profile) => format!("miphone {} – {profile}", env!("CARGO_PKG_VERSION")),
@@ -115,6 +117,32 @@ enum Backend {
     /// The softphone signed off at the telephone system for good.
     SignedOff,
 }
+
+/// What is known about a newer version of the program.
+enum UpdateState {
+    Unknown,
+    /// The user asked to look for one.
+    Checking,
+    /// There is none.
+    Current,
+    Available(Release),
+    Installing(Release),
+    /// It is in place; the program starts again as soon as no call is in the way.
+    Restarting,
+    /// What went wrong, and the page of the release to get it by hand.
+    Failed { error: String, page: Option<String> },
+}
+
+/// Results of the background tasks that look for and install updates.
+enum UpdateMessage {
+    /// `asked`: the user looked for updates, as opposed to the program by itself.
+    Checked { result: Result<Option<Release>, String>, asked: bool },
+    /// The path of the program to start again.
+    Installed(Result<std::path::PathBuf, String>),
+}
+
+/// The program looks for updates at its start and then again after this time.
+const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// One of the user's contact groups with the ids of its members.
 #[derive(Debug, Clone, PartialEq)]
@@ -564,6 +592,17 @@ struct App {
     headset: Option<(Headset, std_mpsc::Receiver<Button>)>,
     /// The headsets found, to show in the settings.
     headsets: Vec<String>,
+    /// The program looks for updates by itself.
+    update_check: bool,
+    /// The version of an update the user does not want to be asked about again.
+    skipped_update: Option<String>,
+    update: UpdateState,
+    /// The window about the update is open.
+    update_window: bool,
+    update_results: (std_mpsc::Sender<UpdateMessage>, std_mpsc::Receiver<UpdateMessage>),
+    last_update_check: Option<Instant>,
+    /// The updated program, to be started when this one has closed.
+    restart: Option<std::path::PathBuf>,
     /// The corporate directory, sorted by name, and the marker for syncing changes.
     contacts: Vec<Contact>,
     directory_timestamp: serde_json::Value,
@@ -787,6 +826,13 @@ impl App {
             headset_enabled: false,
             headset: None,
             headsets: headset::describe(),
+            update_check: true,
+            skipped_update: None,
+            update: UpdateState::Unknown,
+            update_window: false,
+            update_results: std_mpsc::channel(),
+            last_update_check: None,
+            restart: None,
             contacts: Vec::new(),
             directory_timestamp: serde_json::Value::Null,
             directory_loading: false,
@@ -838,6 +884,8 @@ impl App {
         self.saved_password = settings.password;
         self.last_name_first = settings.last_name_first;
         self.headset_enabled = settings.headset.unwrap_or(false);
+        self.update_check = settings.update_check.unwrap_or(true);
+        self.skipped_update = settings.skipped_update;
         self.ring_outputs = settings.ring_outputs;
         self.ring_tone = Tone::from_setting(&settings.ringtone);
         self.ring_volume = settings.ring_volume.unwrap_or(DEFAULT_RING_VOLUME).min(100);
@@ -885,6 +933,8 @@ impl App {
         self.directory_timestamp = serde_json::Value::Null;
         *self.audio.lock().unwrap() = Default::default();
         self.headset_enabled = false;
+        self.update_check = true;
+        self.skipped_update = None;
         self.ring_outputs.clear();
         self.ring_tone = Tone::default();
         self.ring_volume = DEFAULT_RING_VOLUME;
@@ -914,6 +964,8 @@ impl App {
             ring_volume: Some(self.ring_volume),
             noise_suppression: Some(devices.noise_suppression),
             headset: Some(self.headset_enabled),
+            update_check: Some(self.update_check),
+            skipped_update: self.skipped_update.clone(),
         };
         if let Err(e) = store.save_settings(&settings) {
             self.status_line = format!("Speichern fehlgeschlagen: {e:#}");
@@ -1000,6 +1052,10 @@ impl App {
                 self.can_switch_account = true;
             }
             "status" => self.demo_status_menu = true,
+            "update" => {
+                self.update = UpdateState::Available(Release::sample("9.9.9"));
+                self.update_window = true;
+            }
             // The login form as on first start, without reading or writing saved data.
             "login" => self.logged_in = false,
             "reset" => {
@@ -1235,10 +1291,145 @@ impl App {
                 ui.add_space(6.0);
                 ui.add(egui::Spinner::new().size(22.0));
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new("Wird beendet ...").size(16.0));
+                let text = if self.restart.is_some() { "Wird neu gestartet ..." } else { "Wird beendet ..." };
+                ui.label(egui::RichText::new(text).size(16.0));
                 ui.add_space(6.0);
             });
         });
+    }
+
+    /// Asks GitHub for a newer version, if this build knows where its releases are.
+    fn look_for_update(&mut self, ctx: &egui::Context, asked: bool) {
+        let Some(repository) = update::REPOSITORY else { return };
+        if matches!(self.update, UpdateState::Checking | UpdateState::Installing(_) | UpdateState::Restarting) {
+            return;
+        }
+        self.last_update_check = Some(Instant::now());
+        if asked {
+            self.update = UpdateState::Checking;
+        }
+        let (tx, ctx) = (self.update_results.0.clone(), ctx.clone());
+        self.runtime.spawn(async move {
+            let result = update::check(repository, update::CURRENT).await.map_err(|e| format!("{e:#}"));
+            let _ = tx.send(UpdateMessage::Checked { result, asked });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Downloads the update and puts it in the place of the program.
+    fn install_update(&mut self, ctx: &egui::Context, release: Release) {
+        self.update = UpdateState::Installing(release.clone());
+        let (tx, ctx) = (self.update_results.0.clone(), ctx.clone());
+        self.runtime.spawn(async move {
+            let result = update::install(&release).await.map_err(|e| format!("{e:#}"));
+            let _ = tx.send(UpdateMessage::Installed(result));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Looks for updates from time to time, takes in what came of it and starts the
+    /// updated program when no call is in the way.
+    fn update_updates(&mut self, ctx: &egui::Context) {
+        if self.update_check && !self.demo && self.last_update_check.is_none_or(|at| at.elapsed() >= UPDATE_INTERVAL) {
+            self.look_for_update(ctx, false);
+        }
+        let messages: Vec<UpdateMessage> = self.update_results.1.try_iter().collect();
+        for message in messages {
+            match message {
+                UpdateMessage::Checked { result: Ok(Some(release)), asked } => {
+                    let known = matches!(&self.update, UpdateState::Available(old) if old.version == release.version);
+                    // Asked once per version found, and not at all for one the user skipped.
+                    if asked || (!known && self.skipped_update.as_deref() != Some(release.version.as_str())) {
+                        self.update_window = true;
+                    }
+                    self.update = UpdateState::Available(release);
+                }
+                UpdateMessage::Checked { result: Ok(None), .. } => self.update = UpdateState::Current,
+                UpdateMessage::Checked { result: Err(error), asked } => {
+                    // A search nobody asked for fails quietly; the next one may work.
+                    if asked {
+                        self.update = UpdateState::Failed { error: format!("Die Suche nach Updates ist fehlgeschlagen: {error}"), page: None };
+                    }
+                }
+                UpdateMessage::Installed(Ok(program)) => {
+                    self.restart = Some(program);
+                    self.update = UpdateState::Restarting;
+                }
+                UpdateMessage::Installed(Err(error)) => {
+                    let page = match &self.update {
+                        UpdateState::Installing(release) => Some(release.page.clone()),
+                        _ => None,
+                    };
+                    self.update = UpdateState::Failed { error: format!("Das Update konnte nicht installiert werden: {error}"), page };
+                    self.update_window = true;
+                }
+            }
+        }
+        // Closing signs the softphone off first, see `handle_close`; `on_exit` starts the new one.
+        if self.restart.is_some() && self.closing.is_none() && self.state.call.is_none() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// The window that offers an update and shows how its installation goes. It stays away
+    /// during a call.
+    fn update_window(&mut self, ctx: &egui::Context) {
+        if !self.update_window || self.closing.is_some() || self.state.call.is_some() {
+            return;
+        }
+        let mut install = None;
+        egui::Modal::new(egui::Id::unique("update")).show(ctx, |ui| {
+            ui.set_width(280.0);
+            match &self.update {
+                UpdateState::Available(release) => {
+                    ui.heading("Update verfügbar");
+                    ui.add_space(6.0);
+                    ui.label(format!("miphone {} ist verfügbar. Installiert ist {}.", release.version, update::CURRENT));
+                    ui.hyperlink_to("Was ist neu?", &release.page);
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Zum Aktualisieren meldet sich miphone ab und startet neu.").weak().small());
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Jetzt aktualisieren").clicked() {
+                            install = Some(release.clone());
+                        }
+                        if ui.button("Später").clicked() {
+                            self.update_window = false;
+                        }
+                        if ui.button("Überspringen").on_hover_text("Nach dieser Version nicht mehr fragen").clicked() {
+                            self.skipped_update = Some(release.version.clone());
+                            self.update_window = false;
+                        }
+                    });
+                }
+                UpdateState::Installing(release) => {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(22.0));
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(format!("miphone {} wird geladen ...", release.version)).size(16.0));
+                    });
+                }
+                UpdateState::Failed { error, page } => {
+                    ui.heading("Update fehlgeschlagen");
+                    ui.add_space(6.0);
+                    ui.label(error);
+                    if let Some(page) = page {
+                        ui.hyperlink_to("Zur Seite der Version", page);
+                    }
+                    ui.add_space(10.0);
+                    if ui.button("Schließen").clicked() {
+                        self.update_window = false;
+                    }
+                }
+                UpdateState::Unknown | UpdateState::Checking | UpdateState::Current | UpdateState::Restarting => self.update_window = false,
+            }
+        });
+        if !self.update_window && self.skipped_update.is_some() {
+            self.persist();
+        }
+        if let Some(release) = install {
+            self.install_update(ctx, release);
+        }
     }
 
     /// Keeps the headsets informed about the call and acts on their buttons.
@@ -2221,6 +2412,43 @@ impl App {
         ui.label(egui::RichText::new(found).weak().small());
         ui.add_space(16.0);
         self.ringtone_settings(ui);
+        ui.add_space(16.0);
+        self.update_settings(ui);
+    }
+
+    /// Whether the program looks for updates, and what it found.
+    fn update_settings(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Updates").strong());
+        if update::REPOSITORY.is_none() {
+            let text = format!("Version {}, selbst gebaut. Updates gibt es nur für die veröffentlichten Versionen.", update::CURRENT);
+            ui.label(egui::RichText::new(text).weak().small());
+            return;
+        }
+        if ui.checkbox(&mut self.update_check, "Automatisch nach Updates suchen").changed() {
+            self.persist();
+        }
+        ui.label(egui::RichText::new("Beim Start und danach alle sechs Stunden. Vor dem Installieren wird gefragt.").weak().small());
+        ui.add_space(6.0);
+        let busy = matches!(self.update, UpdateState::Checking | UpdateState::Installing(_) | UpdateState::Restarting);
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!busy, egui::Button::new("Jetzt suchen")).clicked() {
+                let ctx = ui.ctx().clone();
+                self.look_for_update(&ctx, true);
+            }
+            if matches!(self.update, UpdateState::Available(_)) && ui.button("Installieren ...").clicked() {
+                self.update_window = true;
+            }
+        });
+        let text = match &self.update {
+            UpdateState::Unknown => format!("Installiert ist Version {}.", update::CURRENT),
+            UpdateState::Checking => "Suche läuft ...".to_string(),
+            UpdateState::Current => format!("Version {} ist aktuell.", update::CURRENT),
+            UpdateState::Available(release) => format!("Version {} ist verfügbar. Installiert ist {}.", release.version, update::CURRENT),
+            UpdateState::Installing(release) => format!("Version {} wird geladen ...", release.version),
+            UpdateState::Restarting => "Das Update ist installiert. miphone startet neu, sobald kein Gespräch läuft.".to_string(),
+            UpdateState::Failed { error, .. } => error.clone(),
+        };
+        ui.label(egui::RichText::new(text).weak().small());
     }
 
     /// Where the ringtone plays, which one and how loud.
@@ -2364,6 +2592,7 @@ impl eframe::App for App {
         self.handle_close(ctx);
         self.update_ringer();
         self.update_headset(ctx);
+        self.update_updates(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -2372,7 +2601,9 @@ impl eframe::App for App {
         } else {
             self.login_screen(ui);
         }
-        self.closing_notice(ui.ctx());
+        let ctx = ui.ctx().clone();
+        self.update_window(&ctx);
+        self.closing_notice(&ctx);
     }
 
     fn on_exit(&mut self) {
@@ -2381,6 +2612,10 @@ impl eframe::App for App {
         if self.commands.is_some() {
             self.send(Command::Quit);
             std::thread::sleep(Duration::from_millis(1500));
+        }
+        if let Some(program) = self.restart.take() {
+            // With what this one was started with, e.g. the profile.
+            let _ = std::process::Command::new(program).args(std::env::args_os().skip(1)).spawn();
         }
     }
 }

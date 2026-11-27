@@ -53,6 +53,10 @@ pub struct Settings {
     pub noise_suppression: Option<bool>,
     /// The buttons and lights of USB headsets are used; `None` is the program's default (off).
     pub headset: Option<bool>,
+    /// The program looks for updates by itself; `None` is the program's default (on).
+    pub update_check: Option<bool>,
+    /// The version of an update the user does not want to be asked about again.
+    pub skipped_update: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +330,8 @@ mod tests {
             ring_volume: Some(40),
             noise_suppression: Some(false),
             headset: Some(true),
+            update_check: Some(false),
+            skipped_update: Some("1.2.3".into()),
         };
         store.save_settings(&settings).unwrap();
         let raw = std::fs::read(dir.path().join("settings.dat")).unwrap();

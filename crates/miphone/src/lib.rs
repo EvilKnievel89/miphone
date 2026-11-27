@@ -10,4 +10,5 @@ pub mod provision;
 pub mod ringtone;
 pub mod store;
 pub mod ua;
+pub mod update;
 pub mod wsp;

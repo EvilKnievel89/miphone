@@ -34,6 +34,9 @@ Windows only. The user interface is in German.
 - **Ringback and busy tone** on outgoing calls, made by the program (425 Hz in the German
   rhythm) unless the other end sends sound of its own.
 - **A short tone when a call is connected and when it ends**, as on mobile phones.
+- **Updates**: the released program looks for a newer release on GitHub, asks, and then
+  replaces itself and starts again. Those who run a pre-release are offered pre-releases
+  too. To be switched off in the settings.
 - **Own contacts**: contacts the user creates, stored encrypted on the computer only.
 - **Call history**, kept locally.
 - **Local data is encrypted** with the Windows account (DPAPI) under `%APPDATA%\miphone`.
@@ -74,7 +77,7 @@ used side by side. The name may contain letters, digits, `-` and `_`.
 
 `miphone-gui.exe --demo` opens the window with sample data and without any network
 connection, which is useful when working on the layout. Variants: `--demo=call`,
-`incoming`, `history`, `settings`, `status`, `contacts`, `numbers`, `own`, `newcontact`, `savenumber`, `missed`, `closing`,
+`incoming`, `history`, `settings`, `status`, `update`, `contacts`, `numbers`, `own`, `newcontact`, `savenumber`, `missed`, `closing`,
 `login`, `reset`.
 
 ## Using the command line version

@@ -28,6 +28,7 @@ tokio-native-tls = "0.3.1"
 tokio-tungstenite = { version = "0.30.0", features = ["native-tls"] }
 toml = "1.2.3"
 windows-sys = { version = "0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_NetworkManagement_Dns", "Win32_Devices_HumanInterfaceDevice", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_Security"] }
+zip = { version = "9.8.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
