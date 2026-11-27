@@ -1,0 +1,53 @@
+name: Release
+
+# Builds the programs and publishes them as a GitHub release when a version tag is pushed
+# (release.ps1 --push does that). A tag with a suffix, e.g. v1.2.3-pre.1, gives a pre-release.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that the tag is the version of the crates
+        run: |
+          $version = "$env:GITHUB_REF_NAME" -replace '^v', ''
+          $manifest = Get-Content crates/miphone-gui/Cargo.toml -Raw
+          if ($manifest -notmatch "(?m)^version = `"$([regex]::Escape($version))`"") {
+            throw "Tag $env:GITHUB_REF_NAME does not match the version in crates/miphone-gui/Cargo.toml"
+          }
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --workspace --locked
+
+      - name: Pack
+        run: |
+          $name = "miphone-$env:GITHUB_REF_NAME-windows-x64"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item target/release/miphone-gui.exe, target/release/miphone.exe, README.md, LICENSE, config.example.toml $name
+          Copy-Item crates/miphone/assets/ringtones/NOTICE.txt "$name/ringtones-NOTICE.txt"
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          "ASSET=$name.zip" >> $env:GITHUB_ENV
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $options = @('--title', "miphone $env:GITHUB_REF_NAME", '--generate-notes', '--verify-tag')
+          if ($env:GITHUB_REF_NAME -match '-') { $options += '--prerelease' }
+          gh release create $env:GITHUB_REF_NAME $env:ASSET @options
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit code $LASTEXITCODE" }
