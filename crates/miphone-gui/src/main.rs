@@ -18,6 +18,7 @@ use egui_material_icons::icons::{
 };
 use egui_material_icons::{icon_text, MaterialIcon};
 use miphone::config::{MicollabConfig, SipConfig};
+use miphone::headset::{self, Button, CallLights, Headset};
 use miphone::media::{self, AudioSettings};
 use miphone::micollab::{self, Contact, Status};
 use miphone::provision;
@@ -557,6 +558,12 @@ struct App {
     /// Show contacts as "Last, First" sorted by last name instead of "First Last" sorted by
     /// first name.
     last_name_first: bool,
+    /// The buttons and lights of USB headsets are used for calls.
+    headset_enabled: bool,
+    /// The connection to the headsets while that is on, with the buttons pressed on them.
+    headset: Option<(Headset, std_mpsc::Receiver<Button>)>,
+    /// The headsets found, to show in the settings.
+    headsets: Vec<String>,
     /// The corporate directory, sorted by name, and the marker for syncing changes.
     contacts: Vec<Contact>,
     directory_timestamp: serde_json::Value,
@@ -777,6 +784,9 @@ impl App {
             demo_status_menu: false,
             demo_number_menu: false,
             last_name_first: false,
+            headset_enabled: false,
+            headset: None,
+            headsets: headset::describe(),
             contacts: Vec::new(),
             directory_timestamp: serde_json::Value::Null,
             directory_loading: false,
@@ -827,6 +837,7 @@ impl App {
         self.login.teleworker = settings.teleworker;
         self.saved_password = settings.password;
         self.last_name_first = settings.last_name_first;
+        self.headset_enabled = settings.headset.unwrap_or(false);
         self.ring_outputs = settings.ring_outputs;
         self.ring_tone = Tone::from_setting(&settings.ringtone);
         self.ring_volume = settings.ring_volume.unwrap_or(DEFAULT_RING_VOLUME).min(100);
@@ -873,6 +884,7 @@ impl App {
         self.set_contacts(Vec::new());
         self.directory_timestamp = serde_json::Value::Null;
         *self.audio.lock().unwrap() = Default::default();
+        self.headset_enabled = false;
         self.ring_outputs.clear();
         self.ring_tone = Tone::default();
         self.ring_volume = DEFAULT_RING_VOLUME;
@@ -901,6 +913,7 @@ impl App {
             ringtone: self.ring_tone.to_setting(),
             ring_volume: Some(self.ring_volume),
             noise_suppression: Some(devices.noise_suppression),
+            headset: Some(self.headset_enabled),
         };
         if let Err(e) = store.save_settings(&settings) {
             self.status_line = format!("Speichern fehlgeschlagen: {e:#}");
@@ -1226,6 +1239,40 @@ impl App {
                 ui.add_space(6.0);
             });
         });
+    }
+
+    /// Keeps the headsets informed about the call and acts on their buttons.
+    fn update_headset(&mut self, ctx: &egui::Context) {
+        let wanted = self.headset_enabled && self.logged_in && !self.demo;
+        if !wanted {
+            self.headset = None;
+            return;
+        }
+        if self.headset.is_none() {
+            let (pressed, buttons) = std_mpsc::channel();
+            let ctx = ctx.clone();
+            let headset = Headset::start(move |button| {
+                let _ = pressed.send(button);
+                ctx.request_repaint();
+            });
+            self.headset = Some((headset, buttons));
+        }
+        let Some((headset, buttons)) = &self.headset else { return };
+        let call = self.state.call.as_ref().map(|call| (call.phase, call.muted));
+        headset.set_lights(match call {
+            Some((CallPhase::Incoming, _)) => CallLights { ringing: self.closing.is_none(), off_hook: false, muted: false },
+            Some((_, muted)) => CallLights { ringing: false, off_hook: true, muted },
+            None => CallLights::default(),
+        });
+        let pressed: Vec<Button> = buttons.try_iter().collect();
+        for button in pressed {
+            match (button, call) {
+                (Button::Answer, Some((CallPhase::Incoming, _))) => self.send(Command::Answer),
+                (Button::HangUp, Some((CallPhase::Dialing | CallPhase::Active | CallPhase::Held, _))) => self.send(Command::Hangup),
+                (Button::ToggleMute, Some((CallPhase::Active | CallPhase::Held, muted))) => self.send(Command::Mute(!muted)),
+                _ => {}
+            }
+        }
     }
 
     /// Starts and stops the ringtone: it plays while a call rings here and while the user
@@ -2151,6 +2198,7 @@ impl App {
         ui.add_space(6.0);
         if ui.button("Geräteliste aktualisieren").clicked() {
             (self.inputs, self.outputs) = media::list_devices();
+            self.headsets = headset::describe();
         }
         ui.label(egui::RichText::new("Die Auswahl gilt ab dem nächsten Gespräch.").weak().small());
         ui.add_space(6.0);
@@ -2160,6 +2208,17 @@ impl App {
             self.persist();
         }
         ui.label(egui::RichText::new("Nimmt Hintergrundgeräusche heraus. Wirkt sofort, auch im Gespräch.").weak().small());
+        ui.add_space(6.0);
+        if ui.checkbox(&mut self.headset_enabled, "Headset-Tasten verwenden").changed() {
+            self.headsets = headset::describe();
+            self.persist();
+        }
+        let found = match self.headsets.as_slice() {
+            [] => "Kein USB-Headset mit Ruftaste gefunden.".to_string(),
+            headsets => format!("Gefunden: {}", headsets.join("; ")),
+        };
+        ui.label(egui::RichText::new("Annehmen, Auflegen und Stumm per Taste am USB-Headset; es zeigt Klingeln und Gespräch an.").weak().small());
+        ui.label(egui::RichText::new(found).weak().small());
         ui.add_space(16.0);
         self.ringtone_settings(ui);
     }
@@ -2304,6 +2363,7 @@ impl eframe::App for App {
         self.poll_backend(ctx);
         self.handle_close(ctx);
         self.update_ringer();
+        self.update_headset(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

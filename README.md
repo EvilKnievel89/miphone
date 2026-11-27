@@ -27,6 +27,9 @@ Windows only. The user interface is in German.
 - **Phone book**: the corporate directory and the user's contact groups, with search.
 - **Ringtone**: two built-in tones or a sound file of your own, on one or several output
   devices, with its own volume.
+- **Headset buttons**: answer, hang up and mute with the buttons of a USB headset, which
+  shows ringing and the call in progress (standard USB HID telephony, no software of the
+  maker needed). Off until switched on in the settings.
 - **Noise suppression** for the microphone (RNNoise), to be switched off in the settings.
 - **Ringback and busy tone** on outgoing calls, made by the program (425 Hz in the German
   rhythm) unless the other end sends sound of its own.

@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod dns;
+pub mod headset;
 pub mod media;
 pub mod micollab;
 pub mod provision;

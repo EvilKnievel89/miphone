@@ -51,6 +51,8 @@ pub struct Settings {
     pub ring_volume: Option<u8>,
     /// Noise suppression for the microphone; `None` is the program's default (on).
     pub noise_suppression: Option<bool>,
+    /// The buttons and lights of USB headsets are used; `None` is the program's default (off).
+    pub headset: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,6 +325,7 @@ mod tests {
             ringtone: "builtin:1".into(),
             ring_volume: Some(40),
             noise_suppression: Some(false),
+            headset: Some(true),
         };
         store.save_settings(&settings).unwrap();
         let raw = std::fs::read(dir.path().join("settings.dat")).unwrap();
