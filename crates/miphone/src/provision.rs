@@ -27,8 +27,9 @@ const CLIENT_VERSION: &str = "10.3.8";
 pub struct Account {
     /// The registrar; also the domain of the SIP addresses.
     pub server: String,
+    /// Port 0: the servers are looked up via DNS (SRV records of `server`).
     pub port: u16,
-    /// Host and port to connect to if they differ from the registrar.
+    /// Host and port to connect to if they differ from the registrar; port 0 as above.
     pub outbound_proxy: Option<(String, u16)>,
     pub user: String,
     pub password: String,
@@ -445,15 +446,12 @@ fn extract(profile: &Value, teleworker: Option<bool>) -> Result<Profile> {
         if get(section, "sip_srtp_mode").is_some_and(|m| m.eq_ignore_ascii_case("mandatory")) {
             bail!("Das {what} verlangt SRTP; das wird noch nicht unterstuetzt.");
         }
-        // No port means 5060 to the Mitel client; port 0 means "look the server up via DNS SRV".
+        // No port means 5060 to the Mitel client; port 0 means "look the server up via DNS SRV"
+        // and is kept as it is.
         let port_of = |key: &str| -> Result<u16> {
             match get(section, key) {
                 None => Ok(5060),
-                Some(p) => match p.trim().parse::<u16>() {
-                    Ok(0) => bail!("Das {what} verlangt die Suche des Servers ueber DNS (SRV, Port 0); das wird noch nicht unterstuetzt."),
-                    Ok(port) => Ok(port),
-                    Err(_) => bail!("Das {what} nennt einen ungueltigen Port ({key})."),
-                },
+                Some(p) => p.trim().parse::<u16>().map_err(|_| anyhow::anyhow!("Das {what} nennt einen ungueltigen Port ({key}).")),
             }
         };
         let outbound_proxy = match get(section, "sip_outbound_proxy") {
@@ -461,7 +459,7 @@ fn extract(profile: &Value, teleworker: Option<bool>) -> Result<Profile> {
             Some(host) => Some((host, port_of("sip_outbound_proxy_port")?)),
             None => None,
         };
-        let port = if outbound_proxy.is_some() { get(section, "sip_proxy_port").and_then(|p| p.trim().parse().ok()).filter(|p| *p != 0).unwrap_or(5060) } else { port_of("sip_proxy_port")? };
+        let port = if outbound_proxy.is_some() { get(section, "sip_proxy_port").and_then(|p| p.trim().parse().ok()).unwrap_or(5060) } else { port_of("sip_proxy_port")? };
         Ok(Account { server, port, outbound_proxy, user, password, ca_chain: get(section, "sip_tls_ca_chain") })
     };
     let by_profile = get("general", "use_teleworker").map(|v| truthy(Some(v))).unwrap_or(true);
@@ -680,11 +678,12 @@ mod tests {
     #[test]
     fn extracts_teleworker_account() {
         let p = extract(&serde_json::from_str(PROFILE).unwrap(), None).unwrap();
-        // The PBX account needs DNS SRV (port 0), so there is nothing to switch to.
-        assert_eq!(p, Profile { account: account("mbg.example.org", 5061, "alice@example.org-1000", "twpw"), teleworker: true, other: None, number: None, acd: false });
-        // Asking for the PBX account does not silently fall back to the gateway.
-        let e = format!("{:#}", extract(&serde_json::from_str(PROFILE).unwrap(), Some(false)).unwrap_err());
-        assert!(e.contains("DNS") && e.contains("Telefonanlage"), "{e}");
+        // The PBX account is found via DNS SRV (port 0).
+        let pbx = account("pbx.local", 0, "1000", "pbxpw");
+        assert_eq!(p, Profile { account: account("mbg.example.org", 5061, "alice@example.org-1000", "twpw"), teleworker: true, other: Some(pbx.clone()), number: None, acd: false });
+        // Asking for the PBX account gives that one.
+        let p = extract(&serde_json::from_str(PROFILE).unwrap(), Some(false)).unwrap();
+        assert_eq!((p.account, p.teleworker), (pbx, false));
     }
 
     #[test]
@@ -780,6 +779,20 @@ mod tests {
         let p = extract(&v, None).unwrap();
         assert_eq!((p.account.server.as_str(), p.account.outbound_proxy.clone()), ("pbx.local", Some(("edge.example.org".to_string(), 5071))));
         assert_eq!(p.other.unwrap().port, 5060, "no port given");
+    }
+
+    #[test]
+    fn keeps_port_zero_for_the_dns_lookup() {
+        let v: Value = serde_json::from_str(
+            r#"{"general": {"use teleworker": false},
+                "accounts": {"x": {"pbx": {"sip user name": "1", "sip password": "p", "sip proxy ip": "pbx.example.org", "sip proxy port": "0"}}}}"#,
+        )
+        .unwrap();
+        let p = extract(&v, None).unwrap();
+        assert_eq!((p.account.server.as_str(), p.account.port), ("pbx.example.org", 0));
+        let mut cfg = crate::config::SipConfig::default();
+        cfg.use_account(&p.account);
+        assert_eq!((cfg.connect_to(), cfg.host_port()), (("pbx.example.org", 0), "pbx.example.org".to_string()));
     }
 
     #[test]

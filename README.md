@@ -32,9 +32,8 @@ Windows only. The user interface is in German.
 - **Local data is encrypted** with the Windows account (DPAPI) under `%APPDATA%\miphone`.
   The password is stored only if "stay signed in" is ticked.
 
-Not implemented: attended transfer, conference and a second call, ringtone, echo
-cancellation, video, chat, voicemail, SRTP, server lookup via DNS SRV, CloudLink and OIDC
-sign-in.
+Not implemented: attended transfer, conference and a second call, echo cancellation,
+video, chat, voicemail, SRTP, CloudLink and OIDC sign-in.
 
 ## Building
 

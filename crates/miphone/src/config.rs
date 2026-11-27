@@ -36,6 +36,7 @@ pub struct SipConfig {
     /// SIP server (MBG or PBX) host name; also used for TLS certificate validation.
     #[serde(default)]
     pub server: String,
+    /// Port 0 looks the servers up via DNS (SRV records `_sips._tcp.<server>`).
     #[serde(default)]
     pub port: Option<u16>,
     /// Host to connect to if it is not the SIP server itself.
@@ -136,7 +137,16 @@ impl SipConfig {
         self.port.unwrap_or(5061)
     }
 
-    /// Host and port the connection goes to: the outbound proxy if there is one.
+    /// The server as it stands in SIP addresses. A server found via DNS has no port there.
+    pub fn host_port(&self) -> String {
+        match self.port() {
+            0 => self.server.clone(),
+            port => format!("{}:{port}", self.server),
+        }
+    }
+
+    /// Host and port the connection goes to: the outbound proxy if there is one. Port 0
+    /// stands for the servers DNS names for that host.
     pub fn connect_to(&self) -> (&str, u16) {
         match self.outbound_proxy.as_deref().filter(|p| !p.is_empty()) {
             Some(proxy) => (proxy, self.outbound_proxy_port.unwrap_or(5061)),

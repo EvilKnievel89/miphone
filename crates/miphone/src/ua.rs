@@ -226,13 +226,25 @@ pub async fn run(
     cmds: &mut mpsc::Receiver<Command>,
 ) -> Result<()> {
     let (host, port) = cfg.connect_to();
-    // A PBX address that is only reachable inside the company network would otherwise keep
-    // the attempt (and a pending change to the other account) waiting for the system's timeout.
-    let tcp = tokio::time::timeout(std::time::Duration::from_secs(8), TcpStream::connect((host, port)))
-        .await
-        .map_err(|_| anyhow::anyhow!("Zeitueberschreitung"))
-        .and_then(|r| r.map_err(Into::into))
-        .with_context(|| format!("Verbindung zu {host}:{port}"))?;
+    // Port 0: DNS names the servers; they are tried in its order until one answers.
+    let servers = if port == 0 { crate::dns::sip_tls_servers(host).await } else { vec![(host.to_string(), port)] };
+    let mut connected = None;
+    let mut failures = Vec::new();
+    for (target, port) in &servers {
+        // A PBX address that is only reachable inside the company network would otherwise keep
+        // the attempt (and a pending change to the other account) waiting for the system's timeout.
+        match tokio::time::timeout(std::time::Duration::from_secs(8), TcpStream::connect((target.as_str(), *port))).await {
+            Ok(Ok(tcp)) => {
+                connected = Some((tcp, *port));
+                break;
+            }
+            Ok(Err(e)) => failures.push(format!("{target}:{port}: {e}")),
+            Err(_) => failures.push(format!("{target}:{port}: Zeitueberschreitung")),
+        }
+    }
+    let Some((tcp, port)) = connected else {
+        return Err(anyhow!("Verbindung zu {}", failures.join("; ")));
+    };
     tcp.set_nodelay(true).ok();
     let local = tcp.local_addr()?;
     let mut builder = native_tls::TlsConnector::builder();
@@ -328,7 +340,7 @@ where
         evicted: false,
         call: None,
     };
-    say!(ua, "Verbunden mit {}:{} (lokal {})", cfg.server, cfg.port(), local);
+    say!(ua, "Verbunden mit {} (lokal {})", cfg.host_port(), local);
 
     loop {
         tokio::select! {
@@ -398,12 +410,12 @@ impl<S: AsyncRead + AsyncWrite> Ua<'_, S> {
     }
 
     fn registrar(&self) -> String {
-        format!("sips:{}:{};transport=tls", self.cfg.server, self.cfg.port())
+        format!("sips:{};transport=tls", self.cfg.host_port())
     }
 
     /// Address of record as a name-addr.
     fn aor(&self) -> String {
-        format!("\"{}\" <sips:{}@{}:{};transport=tls>", self.cfg.user, self.user_escaped(), self.cfg.server, self.cfg.port())
+        format!("\"{}\" <sips:{}@{};transport=tls>", self.cfg.user, self.user_escaped(), self.cfg.host_port())
     }
 
     fn contact_uri(&self) -> String {
@@ -813,7 +825,7 @@ impl<S: AsyncRead + AsyncWrite> Ua<'_, S> {
     /// Blind transfer: asks the peer's side to call `number` instead of us.
     async fn send_refer(&mut self, call: &Call, number: &str) -> Result<()> {
         let mut refer = self.dialog_request(call, "REFER");
-        refer.add("Refer-To", format!("<sips:{}@{}:{}>", number, self.cfg.server, self.cfg.port()));
+        refer.add("Refer-To", format!("<sips:{}@{}>", number, self.cfg.host_port()));
         refer.add("Referred-By", format!("<{}>", uri_of(&self.aor())));
         refer.add("Contact", self.contact());
         self.send_request(refer).await
@@ -1165,7 +1177,7 @@ impl<S: AsyncRead + AsyncWrite> Ua<'_, S> {
             return Ok(());
         }
         let media = Media::start(self.audio.as_ref()).context("RTP-Socket")?;
-        let uri = format!("sips:{}@{}:{}", number, self.cfg.server, self.cfg.port());
+        let uri = format!("sips:{}@{}", number, self.cfg.host_port());
         let local_tag = random_hex(10);
         let local = format!("{};tag={local_tag}", self.aor());
         let remote = format!("<{uri}>");

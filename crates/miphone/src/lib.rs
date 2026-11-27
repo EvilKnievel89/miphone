@@ -2,6 +2,7 @@
 //! Front ends (command line, graphical) drive it through `ua::Command` and `ua::Event`.
 
 pub mod config;
+pub mod dns;
 pub mod media;
 pub mod micollab;
 pub mod provision;
